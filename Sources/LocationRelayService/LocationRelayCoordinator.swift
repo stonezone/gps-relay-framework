@@ -6,7 +6,7 @@ import WebSocketTransport
 
 @available(iOS 13.0, *)
 public protocol LocationRelayCoordinatorDelegate: AnyObject {
-    func relayCoordinator(_ coordinator: LocationRelayCoordinator, didUpdate fix: LocationFix)
+    func relayCoordinator(_ coordinator: LocationRelayCoordinator, didUpdate update: RelayUpdate)
     func relayCoordinator(_ coordinator: LocationRelayCoordinator, didChangeHealth health: RelayHealth)
     func relayCoordinator(_ coordinator: LocationRelayCoordinator, didUpdateConnection state: ConnectionState)
     func relayCoordinator(_ coordinator: LocationRelayCoordinator, didEncounterError error: Error)
@@ -16,7 +16,7 @@ public protocol LocationRelayCoordinatorDelegate: AnyObject {
 
 @available(iOS 13.0, *)
 public extension LocationRelayCoordinatorDelegate {
-    func relayCoordinator(_ coordinator: LocationRelayCoordinator, didUpdate fix: LocationFix) {}
+    func relayCoordinator(_ coordinator: LocationRelayCoordinator, didUpdate update: RelayUpdate) {}
     func relayCoordinator(_ coordinator: LocationRelayCoordinator, didChangeHealth health: RelayHealth) {}
     func relayCoordinator(_ coordinator: LocationRelayCoordinator, didUpdateConnection state: ConnectionState) {}
     func relayCoordinator(_ coordinator: LocationRelayCoordinator, didEncounterError error: Error) {}
@@ -27,7 +27,7 @@ public extension LocationRelayCoordinatorDelegate {
 @available(iOS 13.0, *)
 public final class LocationRelayCoordinator: NSObject {
 
-    public struct Configuration: Sendable {
+    public struct Configuration: @unchecked Sendable {
         public struct WebSocketEndpoint: Sendable {
             public var url: URL
             public var configuration: WebSocketTransportConfiguration
@@ -45,17 +45,20 @@ public final class LocationRelayCoordinator: NSObject {
         public var qualityOverride: QualityThresholds?
         public var webSocketEndpoint: WebSocketEndpoint?
         public var additionalTransports: [LocationTransport]
+        public var fusionMode: LocationRelayService.FusionMode
 
         public init(
             trackingMode: TrackingMode = .balanced,
             qualityOverride: QualityThresholds? = nil,
             webSocketEndpoint: WebSocketEndpoint? = nil,
-            additionalTransports: [LocationTransport] = []
+            additionalTransports: [LocationTransport] = [],
+            fusionMode: LocationRelayService.FusionMode = .disabled
         ) {
             self.trackingMode = trackingMode
             self.qualityOverride = qualityOverride
             self.webSocketEndpoint = webSocketEndpoint
             self.additionalTransports = additionalTransports
+            self.fusionMode = fusionMode
         }
     }
 
@@ -67,6 +70,7 @@ public final class LocationRelayCoordinator: NSObject {
         didSet {
             service.trackingMode = configuration.trackingMode
             service.qualityOverride = configuration.qualityOverride
+            service.fusionMode = configuration.fusionMode
             webSocketTransport = nil // Rebuild on next start if endpoint changed
             activeWebSocketEndpoint = nil
         }
@@ -91,6 +95,7 @@ public final class LocationRelayCoordinator: NSObject {
         )
         super.init()
         self.service.qualityOverride = configuration.qualityOverride
+        self.service.fusionMode = configuration.fusionMode
         self.service.delegate = self
     }
 
@@ -123,8 +128,12 @@ public final class LocationRelayCoordinator: NSObject {
 
     // MARK: - Accessors
 
+    public var currentSnapshot: RelayUpdate? {
+        service.currentSnapshot()
+    }
+
     public var currentFix: LocationFix? {
-        service.currentFixValue()
+        service.currentFix
     }
 
     // MARK: - Private Helpers
@@ -158,8 +167,8 @@ public final class LocationRelayCoordinator: NSObject {
 
 @available(iOS 13.0, *)
 extension LocationRelayCoordinator: LocationRelayDelegate {
-    public func didUpdate(_ fix: LocationFix) {
-        delegate?.relayCoordinator(self, didUpdate: fix)
+    public func didUpdate(_ update: RelayUpdate) {
+        delegate?.relayCoordinator(self, didUpdate: update)
     }
 
     public func healthDidChange(_ health: RelayHealth) {

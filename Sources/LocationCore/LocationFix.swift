@@ -124,3 +124,15 @@ public enum RelayHealth: Equatable, Sendable {
     case streaming
     case degraded(reason: String)
 }
+
+public struct RelayUpdate: Codable, Equatable, Sendable {
+    public var base: LocationFix?
+    public var remote: LocationFix?
+    public var fused: LocationFix?
+
+    public init(base: LocationFix? = nil, remote: LocationFix? = nil, fused: LocationFix? = nil) {
+        self.base = base
+        self.remote = remote
+        self.fused = fused
+    }
+}

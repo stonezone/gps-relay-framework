@@ -8,7 +8,7 @@ import FoundationNetworking
 // MARK: - Connection State
 
 /// Represents the current state of the WebSocket connection
-public enum ConnectionState: String, CustomStringConvertible {
+public enum ConnectionState: String, CustomStringConvertible, Sendable {
     case disconnected
     case connecting
     case connected
@@ -23,7 +23,7 @@ public enum ConnectionState: String, CustomStringConvertible {
 // MARK: - Configuration
 
 /// Configuration for WebSocket transport behavior
-public struct WebSocketTransportConfiguration {
+public struct WebSocketTransportConfiguration: @unchecked Sendable {
     /// Maximum number of reconnection attempts before giving up
     public var maxReconnectAttempts: Int
     
@@ -118,7 +118,7 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
     private var shouldReconnect: Bool = false
     
     // Message queue for when disconnected
-    private var messageQueue: [LocationFix] = []
+    private var messageQueue: [RelayUpdate] = []
     private let queueLock = NSLock()
     
     // MARK: - Initialization
@@ -166,16 +166,16 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
         connect()
     }
     
-    /// Pushes a location fix to the server
-    /// - Parameter fix: The location fix to send
-    public func push(_ fix: LocationFix) {
+    /// Pushes a relay update to the server
+    /// - Parameter update: The payload containing base/remote fixes
+    public func push(_ update: RelayUpdate) {
         guard let task = task, connectionState == .connected else {
             // Queue message if not connected
-            queueMessage(fix)
+            queueMessage(update)
             return
         }
-        
-        sendMessage(fix, via: task)
+
+        sendMessage(update, via: task)
     }
     
     /// Closes the WebSocket connection
@@ -312,36 +312,35 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
     
     // MARK: - Private Methods - Message Handling
     
-    private func sendMessage(_ fix: LocationFix, via task: URLSessionWebSocketTask) {
+    private func sendMessage(_ update: RelayUpdate, via task: URLSessionWebSocketTask) {
         do {
-            let data = try encoder.encode(fix)
+            let data = try encoder.encode(update)
             task.send(.data(data)) { [weak self] error in
-                if let error = error {
-                    NSLog("[WebSocketTransport] Send error: %@", String(describing: error))
-                    self?.delegate?.webSocketTransport(self!, didEncounterError: error)
-                }
+                guard let self, let error = error else { return }
+                NSLog("[WebSocketTransport] Send error: %@", String(describing: error))
+                self.delegate?.webSocketTransport(self, didEncounterError: error)
             }
         } catch {
             NSLog("[WebSocketTransport] Encoding error: %@", String(describing: error))
             delegate?.webSocketTransport(self, didEncounterError: error)
         }
     }
-    
-    private func queueMessage(_ fix: LocationFix) {
+
+    private func queueMessage(_ update: RelayUpdate) {
         queueLock.lock()
         defer { queueLock.unlock() }
-        
+
         // Enforce queue size limit
         if messageQueue.count >= configuration.maxQueueSize {
             // Remove oldest message
             messageQueue.removeFirst()
             NSLog("[WebSocketTransport] Queue full, dropping oldest message")
         }
-        
-        messageQueue.append(fix)
+
+        messageQueue.append(update)
         NSLog("[WebSocketTransport] Queued message (queue size: %d)", messageQueue.count)
     }
-    
+
     private func flushMessageQueue() {
         queueLock.lock()
         let messagesToSend = messageQueue
@@ -352,8 +351,8 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
         
         NSLog("[WebSocketTransport] Flushing %d queued messages", messagesToSend.count)
         
-        for fix in messagesToSend {
-            sendMessage(fix, via: task)
+        for update in messagesToSend {
+            sendMessage(update, via: task)
         }
     }
     

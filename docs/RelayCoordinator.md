@@ -49,8 +49,15 @@ final class JetsonRelayController: LocationRelayCoordinatorDelegate {
 
     // MARK: - LocationRelayCoordinatorDelegate
 
-    func relayCoordinator(_ coordinator: LocationRelayCoordinator, didUpdate fix: LocationFix) {
-        // Forward to Jetson control loop: combine with base-station GNSS + PTZ control
+    func relayCoordinator(_ coordinator: LocationRelayCoordinator, didUpdate update: RelayUpdate) {
+        if let base = update.base {
+            // Feed stationary base position/heading into tethered controller
+            jetsonBridge.updateBase(base)
+        }
+        if let remote = update.remote {
+            // Use watch track for subject positioning / CV guidance
+            jetsonBridge.updateRemote(remote)
+        }
     }
 
     func relayCoordinator(_ coordinator: LocationRelayCoordinator, didChangeHealth health: RelayHealth) {
@@ -69,7 +76,8 @@ final class JetsonRelayController: LocationRelayCoordinatorDelegate {
 
 ### Notes for Jetson/Orin integration
 
-- The coordinator always streams `LocationFix` values in the same JSON schema used by the existing WebSocket transport. Your Jetson service can decode them exactly as today.
+- The coordinator now emits `RelayUpdate` payloads containing independent `base` (iPhone) and `remote` (watch) fixes. The WebSocket transport serialises them as `{ "base": {...}, "remote": {...}, "fused": null }`.
+- Optional fusion is still available for co-located deployments by setting `configuration.fusionMode = .weightedAverage`, but the default is a strict dual-stream.
 - Tracking mode defaults to `.balanced`; switch to `.realtime` for high-motion sports (surfing, wing foiling) or `.powersaver` for slow telemetry.
 - Health changes indicate whether the watch is providing fresh GPS. Fall back to the phone’s location when health becomes `.degraded`.
 
@@ -95,6 +103,14 @@ If you need to swap transports mid-session, call `restart(with:)` with a new con
 - WebSocket validation enforces `wss://` by default; set `allowInsecureConnections` on `WebSocketTransportConfiguration` only for local development.
 - `authorizationDidFail` forwards the same errors exposed by `LocationRelayService`, making it easy to surface permission issues in host UI.
 - `didEncounterError` surfaces socket-level errors; reconnect logic still runs automatically when allowed.
+
+## BLE CBOR payload map
+
+For BLE transports the payload is encoded as CBOR with compact integer keys:
+
+Payload is a CBOR map with optional `base`, `remote`, and `fused` entries. Each entry mirrors the JSON schema (`ts_unix_ms`, `lat`, `lon`, etc.). Consumers should prefer `base` + `remote` and treat `fused` as legacy/optional.
+
+Payloads longer than 15 chunks at the negotiated MTU are dropped; increase the MTU or trim optional fields if you add more telemetry.
 
 ## Testing tips
 

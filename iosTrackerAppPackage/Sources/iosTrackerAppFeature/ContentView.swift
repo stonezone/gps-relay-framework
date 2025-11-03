@@ -14,13 +14,14 @@ public struct ContentView: View {
                     trackingModeSection
                     webSocketConfigSection
                     connectionStatusSection
-                    currentFixSection
+                    baseStationSection
+                    remoteTrackerSection
                     relayHealthSection
                     watchConnectionSection
 
                     Spacer()
 
-                    Text("v1.0.0")
+                    Text("v1.0.2")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                         .padding(.bottom, 8)
@@ -119,29 +120,42 @@ public struct ContentView: View {
 
     private var webSocketConfigSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Jetson WebSocket")
+            Text("WebSocket")
                 .font(.headline)
 
-            HStack {
-                Image(systemName: "network")
-                    .foregroundColor(.blue)
-                TextField("ws://192.168.55.1:8765", text: $viewModel.webSocketURL)
-                    .textFieldStyle(.roundedBorder)
-                    .autocapitalization(.none)
-                    .keyboardType(.URL)
-                    .disabled(viewModel.isRelayActive)
-            }
-
-            Toggle(isOn: $viewModel.allowInsecureConnections) {
-                Text("Allow insecure ws:// connections")
+            Toggle(isOn: $viewModel.webSocketEnabled) {
+                Text("Enable WebSocket connection")
                     .font(.subheadline)
             }
-            .tint(.orange)
+            .tint(.blue)
             .disabled(viewModel.isRelayActive)
 
-            Text("Use wss:// for production. ws:// is intended for local testing on trusted networks.")
-                .font(.caption)
-                .foregroundColor(.secondary)
+            if viewModel.webSocketEnabled {
+                HStack {
+                    Image(systemName: "network")
+                        .foregroundColor(.blue)
+                    TextField("ws://192.168.55.1:8765", text: $viewModel.webSocketURL)
+                        .textFieldStyle(.roundedBorder)
+                        .autocapitalization(.none)
+                        .keyboardType(.URL)
+                        .disabled(viewModel.isRelayActive)
+                }
+
+                Toggle(isOn: $viewModel.allowInsecureConnections) {
+                    Text("Allow insecure ws:// connections")
+                        .font(.subheadline)
+                }
+                .tint(.orange)
+                .disabled(viewModel.isRelayActive)
+
+                Text("Use wss:// for production. ws:// is intended for local testing on trusted networks.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                Text("WebSocket disabled. Relay will track GPS without sending to external server.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
 
             if viewModel.isRelayActive {
                 Text("Stop relay to edit connection settings.")
@@ -173,36 +187,73 @@ public struct ContentView: View {
         .cornerRadius(12)
     }
 
-    // MARK: - Current Fix
+    // MARK: - Base Station Fix
 
-    private var currentFixSection: some View {
+    private var baseStationSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Image(systemName: "location.fill")
-                    .foregroundColor(.blue)
-                Text("Current GPS Fix")
+                Image(systemName: "antenna.radiowaves.left.and.right")
+                    .foregroundColor(.orange)
+                Text("Base Station (iPhone)")
                     .font(.headline)
                 Spacer()
-                if let timestamp = viewModel.lastFixTimestamp {
+                if let timestamp = viewModel.lastBaseTimestamp {
                     Text(formatTimestamp(timestamp))
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
             }
 
-            if let fix = viewModel.currentFix {
+            if let fix = viewModel.baseFix {
                 VStack(spacing: 8) {
                     fixDetailRow(label: "Latitude", value: String(format: "%.6f°", fix.coordinate.latitude))
                     fixDetailRow(label: "Longitude", value: String(format: "%.6f°", fix.coordinate.longitude))
-                    fixDetailRow(label: "Source", value: fix.source.rawValue)
+                    fixDetailRow(label: "Heading", value: fix.headingDegrees.map { String(format: "%.0f°", $0) } ?? "—")
+                    fixDetailRow(label: "Battery", value: String(format: "%.0f%%", fix.batteryFraction * 100))
+                }
+            } else {
+                Text("No base station fix yet.")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding()
+            }
+        }
+        .padding()
+        .background(Color(.systemGray6))
+        .cornerRadius(12)
+    }
+
+    // MARK: - Remote Tracker Fix
+
+    private var remoteTrackerSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "location.fill")
+                    .foregroundColor(.blue)
+                Text("Remote Tracker (Watch)")
+                    .font(.headline)
+                Spacer()
+                if let timestamp = viewModel.lastRemoteTimestamp {
+                    Text(formatTimestamp(timestamp))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            if let fix = viewModel.remoteFix {
+                VStack(spacing: 8) {
+                    fixDetailRow(label: "Latitude", value: String(format: "%.6f°", fix.coordinate.latitude))
+                    fixDetailRow(label: "Longitude", value: String(format: "%.6f°", fix.coordinate.longitude))
                     fixDetailRow(label: "Accuracy", value: String(format: "±%.1f m", fix.horizontalAccuracyMeters))
                     if let altitude = fix.altitudeMeters {
                         fixDetailRow(label: "Altitude", value: String(format: "%.1f m", altitude))
                     }
                     fixDetailRow(label: "Speed", value: String(format: "%.1f m/s", fix.speedMetersPerSecond))
+                    fixDetailRow(label: "Battery", value: String(format: "%.0f%%", fix.batteryFraction * 100))
                 }
             } else {
-                Text("No GPS fix yet.")
+                Text("No remote tracker fix yet.")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)

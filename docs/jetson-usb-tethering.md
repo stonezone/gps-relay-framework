@@ -27,4 +27,4 @@
    ping -c1 $(ip route get 1.1.1.1 | awk '/src/ {print $7}')
    ```
 
-After the interface is up, start the reference server with `python jetson/jetsrv.py` and connect from the iPhone over `ws://<jetson-ip>:8080`.
+After the interface is up, start the reference server with `python jetson/jetsrv.py` and connect from the iPhone over `ws://<jetson-ip>:8765`.

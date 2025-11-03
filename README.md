@@ -1,30 +1,28 @@
 # GPS Relay Framework
 
-A Swift-based framework for relaying GPS location data between Apple Watch, iPhone, and external systems via WebSocket. Designed for real-time location tracking applications such as autonomous camera tracking, drone following, and other IoT projects.
+A Swift-based framework that turns an **iPhone into a stationary base station** and an **Apple Watch into a roaming tracker**. The phone captures its own GPS/heading, ingests watch fixes wherever the wearer roams, and relays **two distinct streams** to a tethered host (e.g., Jetson) over WebSocket for fusion with local sensors such as computer vision.
 
 ## Overview
 
-This framework provides a complete solution for capturing GPS data from both Apple Watch and iPhone, transmitting it in real-time over WatchConnectivity, and relaying it to external systems (like Jetson devices) via WebSocket.
+This framework provides a complete solution for capturing GPS data from both Apple Watch and iPhone, maintaining the phone’s baseline position while forwarding remote watch updates in near real time. Fixes travel over WatchConnectivity and are relayed to external systems (like Jetson devices) via WebSocket with explicit separation between **base** and **remote** tracks.
 
 **Current Version:** v1.0.0
 
 ## Features
 
-### iPhone App
-- ✅ Real-time GPS tracking with CoreLocation
-- ✅ Magnetic compass heading (direction phone is pointing)
-- ✅ Receives GPS data from Apple Watch via WatchConnectivity
+### iPhone App (Base Station)
+- ✅ Continuous GPS + heading capture for the tethered base
+- ✅ Receives watch fixes via WatchConnectivity (interactive + background paths)
+- ✅ Maintains independent base/remote streams for downstream consumers
 - ✅ WebSocket client for streaming data to external systems
 - ✅ Automatic retry and reconnection
 - ✅ Battery level monitoring
 - ✅ Background location updates
 
-### Apple Watch App
-- ✅ Workout-driven GPS tracking
-- ✅ High-frequency location updates
-- ✅ WatchConnectivity messaging to iPhone
-- ✅ Fallback to file transfer when not reachable
-- ✅ HealthKit integration
+### Apple Watch App (Remote Tracker)
+- ✅ Workout-driven GPS tracking while roaming away from the phone
+- ✅ High-frequency location updates with HealthKit integration
+- ✅ WatchConnectivity messaging plus background transfer/ application-context delivery
 - ✅ Battery level monitoring
 
 ### WebSocket Server (Python)
@@ -51,24 +49,31 @@ pip install websockets jsonschema
 python3 jetsrv.py
 ```
 
+> **Note:** The iOS target includes an ATS exception scoped to `192.168.55.1` so tethered Jetson devices can accept `ws://` connections. Use `wss://` for any production deployment.
+
 ## Data Format
 
-GPS fixes are transmitted as JSON:
+The relay surfaces **base** and **remote** fixes. A typical WebSocket payload:
 
 ```json
 {
-  "ts_unix_ms": 1730000000000,
-  "source": "iOS",
-  "lat": 21.645123,
-  "lon": -158.050456,
-  "alt_m": 10.5,
-  "h_accuracy_m": 5.0,
-  "v_accuracy_m": 8.0,
-  "speed_mps": 1.2,
-  "course_deg": 180.0,
-  "heading_deg": 45.0,
-  "battery_pct": 0.85,
-  "seq": 12345
+  "base": {
+    "ts_unix_ms": 1730000000000,
+    "source": "iOS",
+    "lat": 21.650000,
+    "lon": -158.055000,
+    "heading_deg": 45.0,
+    "battery_pct": 0.92
+  },
+  "remote": {
+    "ts_unix_ms": 1730000000250,
+    "source": "watchOS",
+    "lat": 21.645123,
+    "lon": -158.050456,
+    "speed_mps": 1.2,
+    "battery_pct": 0.78
+  },
+  "fused": null
 }
 ```
 

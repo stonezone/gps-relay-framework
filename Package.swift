@@ -1,12 +1,12 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 import PackageDescription
 
 let package = Package(
     name: "iosTracker",
     defaultLocalization: "en",
     platforms: [
-        .iOS(.v17),
-        .watchOS(.v10)
+        .iOS(.v18),
+        .watchOS(.v11)
     ],
     products: [
         .library(name: "LocationCore", targets: ["LocationCore"]),

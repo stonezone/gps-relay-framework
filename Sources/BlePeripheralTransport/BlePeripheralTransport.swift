@@ -275,7 +275,7 @@ public final class BlePeripheralTransport: NSObject, LocationTransport, CBPeriph
         }
     }
 
-    public func push(_ fix: LocationFix) {
+    public func push(_ update: RelayUpdate) {
         queue.async { [weak self] in
             guard let self = self else { return }
             guard self.peripheralManager.state == .poweredOn else {
@@ -295,7 +295,7 @@ public final class BlePeripheralTransport: NSObject, LocationTransport, CBPeriph
 
             do {
                 // Encode to CBOR
-                let cborData = try CBOREncoder.encode(fix)
+                let cborData = try CBOREncoder.encode(update)
 
                 // Check if chunking is needed
                 let headerSize = 1 // 1 byte for chunk header
@@ -573,7 +573,7 @@ public final class BlePeripheralTransport: NSObject, LocationTransport {
     }
 
     public func open() {}
-    public func push(_ fix: LocationFix) {}
+    public func push(_ update: RelayUpdate) {}
     public func close() {}
 }
 #endif

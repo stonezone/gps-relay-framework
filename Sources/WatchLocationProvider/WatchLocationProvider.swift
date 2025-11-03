@@ -19,8 +19,12 @@ public final class WatchLocationProvider: NSObject {
     private let workoutStore = HKHealthStore()
     private let locationManager = CLLocationManager()
     private var workoutSession: HKWorkoutSession?
+    private var workoutBuilder: HKLiveWorkoutBuilder?
     private var wcSession: WCSession { WCSession.default }
     private let encoder = JSONEncoder()
+    private let fileManager = FileManager.default
+    private var lastContextSequence: Int?
+    private var activeFileTransfers: [WCSessionFileTransfer: (url: URL, fix: LocationFix)] = [:]
 
     public override init() {
         super.init()
@@ -47,7 +51,20 @@ public final class WatchLocationProvider: NSObject {
     public func stop() {
         locationManager.stopUpdatingLocation()
         workoutSession?.end()
+        workoutBuilder?.endCollection(withEnd: Date()) { [weak self] _, error in
+            if let error {
+                self?.delegate?.didFail(error)
+            }
+            self?.workoutBuilder?.finishWorkout { _, finishError in
+                if let finishError {
+                    self?.delegate?.didFail(finishError)
+                }
+            }
+        }
         workoutSession = nil
+        workoutBuilder = nil
+        lastContextSequence = nil
+        activeFileTransfers.removeAll()
     }
 
     private func requestAuthorizationsIfNeeded() {
@@ -57,8 +74,8 @@ public final class WatchLocationProvider: NSObject {
         }
         workoutStore.requestAuthorization(toShare: [], read: readTypes) { _, _ in }
 
-        // Request Always authorization for background location updates
-        locationManager.requestAlwaysAuthorization()
+        // Request maximum available accuracy for workout GPS capture
+        locationManager.requestWhenInUseAuthorization()
     }
 
     private func startWorkoutSession(activity: HKWorkoutActivityType) {
@@ -67,8 +84,18 @@ public final class WatchLocationProvider: NSObject {
         configuration.locationType = .outdoor
         do {
             let session = try HKWorkoutSession(healthStore: workoutStore, configuration: configuration)
+            let builder = session.associatedWorkoutBuilder()
+            builder.dataSource = HKLiveWorkoutDataSource(healthStore: workoutStore, workoutConfiguration: configuration)
+            session.delegate = self
+            builder.delegate = self
             session.startActivity(with: Date())
+            builder.beginCollection(withStart: Date()) { [weak self] _, error in
+                if let error {
+                    self?.delegate?.didFail(error)
+                }
+            }
             workoutSession = session
+            workoutBuilder = builder
         } catch {
             delegate?.didFail(error)
         }
@@ -119,11 +146,13 @@ public final class WatchLocationProvider: NSObject {
 
     private func updateApplicationContextWithFix(_ fix: LocationFix) {
         guard wcSession.activationState == .activated else { return }
+        if lastContextSequence == fix.sequence { return }
         do {
             let data = try encoder.encode(fix)
             let context = ["latestFix": data]
             try wcSession.updateApplicationContext(context)
             print("[WatchLocationProvider] Updated application context with latest fix")
+            lastContextSequence = fix.sequence
         } catch {
             print("[WatchLocationProvider] Failed to update context: \(error.localizedDescription)")
             // Non-fatal, other methods will still deliver
@@ -136,7 +165,8 @@ public final class WatchLocationProvider: NSObject {
             let data = try encoder.encode(fix)
             let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try data.write(to: url)
-            wcSession.transferFile(url, metadata: nil)
+            let transfer = wcSession.transferFile(url, metadata: ["sequence": fix.sequence])
+            activeFileTransfers[transfer] = (url, fix)
             print("[WatchLocationProvider] Queued file transfer")
         } catch {
             delegate?.didFail(error)
@@ -184,7 +214,45 @@ extension WatchLocationProvider: WCSessionDelegate {
 #if os(watchOS)
     public func session(_ session: WCSession, didReceiveMessageData messageData: Data) {}
     public func session(_ session: WCSession, didReceive file: WCSessionFile) {}
+
+    public func session(_ session: WCSession, didFinish fileTransfer: WCSessionFileTransfer, error: Error?) {
+        guard let record = activeFileTransfers.removeValue(forKey: fileTransfer) else { return }
+        defer { try? fileManager.removeItem(at: record.url) }
+
+        if let error {
+            print("[WatchLocationProvider] File transfer failed: \(error.localizedDescription). Retrying…")
+            queueBackgroundTransfer(for: record.fix)
+        } else {
+            print("[WatchLocationProvider] File transfer completed successfully")
+        }
+    }
 #endif
+}
+
+extension WatchLocationProvider: HKWorkoutSessionDelegate {
+    public func workoutSession(_ workoutSession: HKWorkoutSession, didChangeTo toState: HKWorkoutSessionState, from fromState: HKWorkoutSessionState, date: Date) {
+        guard toState == .ended || toState == .stopped else { return }
+        workoutBuilder?.endCollection(withEnd: date) { [weak self] _, error in
+            if let error {
+                self?.delegate?.didFail(error)
+            }
+            self?.workoutBuilder?.finishWorkout { _, finishError in
+                if let finishError {
+                    self?.delegate?.didFail(finishError)
+                }
+            }
+        }
+    }
+
+    public func workoutSession(_ workoutSession: HKWorkoutSession, didFailWithError error: Error) {
+        delegate?.didFail(error)
+    }
+}
+
+extension WatchLocationProvider: HKLiveWorkoutBuilderDelegate {
+    public func workoutBuilder(_ workoutBuilder: HKLiveWorkoutBuilder, didCollectDataOf collectedTypes: Set<HKSampleType>) {}
+
+    public func workoutBuilderDidCollectEvent(_ workoutBuilder: HKLiveWorkoutBuilder) {}
 }
 
 #else
@@ -206,4 +274,3 @@ public final class WatchLocationProvider {
     public func stop() {}
 }
 #endif
-

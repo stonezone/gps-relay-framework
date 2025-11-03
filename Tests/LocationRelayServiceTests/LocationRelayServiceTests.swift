@@ -10,17 +10,21 @@ import WatchConnectivity
 
 final class MockTransport: LocationTransport {
     var isOpen = false
-    var pushedFixes: [LocationFix] = []
+    var pushedUpdates: [RelayUpdate] = []
     var openCallCount = 0
     var closeCallCount = 0
+
+    var pushedFixes: [LocationFix] {
+        pushedUpdates.compactMap { $0.remote ?? $0.base ?? $0.fused }
+    }
 
     func open() {
         isOpen = true
         openCallCount += 1
     }
 
-    func push(_ fix: LocationFix) {
-        pushedFixes.append(fix)
+    func push(_ update: RelayUpdate) {
+        pushedUpdates.append(update)
     }
 
     func close() {
@@ -93,13 +97,17 @@ final class MockLocationManager: LocationManagerProtocol {
 // MARK: - Mock Delegate
 
 final class MockRelayDelegate: LocationRelayDelegate {
-    var updatedFixes: [LocationFix] = []
+    var updatedSnapshots: [RelayUpdate] = []
     var healthChanges: [RelayHealth] = []
     var connectionChanges: [Bool] = []
     var authorizationFailures: [LocationRelayError] = []
 
-    func didUpdate(_ fix: LocationFix) {
-        updatedFixes.append(fix)
+    var updatedFixes: [LocationFix] {
+        updatedSnapshots.compactMap { $0.remote ?? $0.base ?? $0.fused }
+    }
+
+    func didUpdate(_ update: RelayUpdate) {
+        updatedSnapshots.append(update)
     }
 
     func healthDidChange(_ health: RelayHealth) {

@@ -1,9 +1,9 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 import PackageDescription
 
 let package = Package(
     name: "watchTrackerAppFeature",
-    platforms: [.watchOS(.v10)],
+    platforms: [.watchOS(.v11)],
     products: [
         .library(
             name: "watchTrackerAppFeature",

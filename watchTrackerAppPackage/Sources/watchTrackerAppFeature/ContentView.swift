@@ -5,7 +5,7 @@ public struct ContentView: View {
     @StateObject private var viewModel = WatchLocationViewModel()
 
     public var body: some View {
-        NavigationView {
+        NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
                     // MARK: - Workout Control Section
@@ -30,7 +30,6 @@ public struct ContentView: View {
                 .padding()
             }
             .navigationTitle("GPS Tracker")
-            .navigationBarTitleDisplayMode(.inline)
         }
     }
 

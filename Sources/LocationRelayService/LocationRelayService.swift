@@ -84,10 +84,10 @@ public enum TrackingMode: String, CaseIterable {
 }
 
 
-public protocol LocationTransport {
+public protocol LocationTransport: Sendable {
     func open()
     func close()
-    func push(_ fix: LocationFix)
+    func push(_ update: RelayUpdate)
 }
 
 public protocol LocationManagerProtocol: AnyObject {
@@ -136,7 +136,7 @@ import WatchConnectivity
 import UIKit
 
 public protocol LocationRelayDelegate: AnyObject {
-    func didUpdate(_ fix: LocationFix)
+    func didUpdate(_ update: RelayUpdate)
     func healthDidChange(_ health: RelayHealth)
     func watchConnectionDidChange(_ isConnected: Bool)
     func authorizationDidFail(_ error: LocationRelayError)
@@ -148,7 +148,22 @@ public extension LocationRelayDelegate {
 
 
 public final class LocationRelayService: NSObject, @unchecked Sendable {
-    public weak var delegate: LocationRelayDelegate?
+    public weak var delegate: LocationRelayDelegate? {
+        didSet {
+            guard delegate !== oldValue else { return }
+            let currentHealth = health
+            let watchState = isWatchConnected
+            let latestUpdate = currentUpdate
+            Task { @MainActor [weak self] in
+                guard let self, let delegate = self.delegate else { return }
+                delegate.healthDidChange(currentHealth)
+                delegate.watchConnectionDidChange(watchState)
+                if let latestUpdate {
+                    delegate.didUpdate(latestUpdate)
+                }
+            }
+        }
+    }
 
     private let locationManager: LocationManagerProtocol
     public var trackingMode: TrackingMode {
@@ -195,7 +210,19 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
     private var canStartLocationAfterAuth = false
     private var backgroundActivitySession: AnyObject?
 
-    private(set) var currentFix: LocationFix?
+    private var latestWatchFix: LocationFix?
+    private var latestPhoneFix: LocationFix?
+    private let fusionWindow: TimeInterval = 5
+    private var lastSequenceBySource: [LocationFix.Source: Int] = [:]
+
+    public enum FusionMode: Sendable {
+        case disabled
+        case weightedAverage
+    }
+
+    public var fusionMode: FusionMode = .disabled
+
+    private(set) var currentUpdate: RelayUpdate?
 
     private var activeQualityThresholds: QualityThresholds {
         qualityOverride ?? trackingMode.configuration.qualityThresholds
@@ -223,6 +250,9 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
         canStartLocationAfterAuth = true
         requestAuthorizations()
         transports.forEach { $0.open() }
+        if CLLocationManager.locationServicesEnabled(), isAuthorized(currentAuthorizationStatus()), !isPhoneLocationActive {
+            startPhoneLocation()
+        }
     }
 
     public func stop() {
@@ -232,10 +262,24 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
         health = .idle
         watchSilenceTimer?.invalidate()
         watchSilenceTimer = nil
+        canStartLocationAfterAuth = false
+        latestWatchFix = nil
+        latestPhoneFix = nil
+        currentUpdate = nil
+        lastSequenceBySource.removeAll()
     }
 
+    public func currentSnapshot() -> RelayUpdate? {
+        currentUpdate
+    }
+
+    public var currentFix: LocationFix? {
+        currentUpdate?.remote ?? currentUpdate?.base ?? currentUpdate?.fused
+    }
+
+    @available(*, deprecated, message: "Use currentSnapshot() to access base/remote data")
     public func currentFixValue() -> LocationFix? {
-        currentFix
+        currentUpdate?.remote ?? currentUpdate?.base ?? currentUpdate?.fused
     }
 
     public func addTransport(_ transport: LocationTransport) {
@@ -263,32 +307,52 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
     }
 
     private func handleInboundFix(_ fix: LocationFix) {
-        // Track watch fixes separately from phone fixes
-        // Use reception time (Date()) instead of fix.timestamp to properly handle
-        // delayed file transfers - we care about when we RECEIVED the data
+        // Deduplicate repeated sequences from retries/background transfers
+        if let lastSeq = lastSequenceBySource[fix.source], lastSeq == fix.sequence {
+            print("[LocationRelayService] Ignoring duplicate fix for \(fix.source) seq=\(fix.sequence)")
+            return
+        }
+        lastSequenceBySource[fix.source] = fix.sequence
+
+        // Track watch fixes separately from phone fixes using reception time
         if fix.source == .watchOS {
             lastWatchFixDate = Date()
         }
 
-        // Always push fixes to transports (both watch and phone)
-        Task { @MainActor [weak self, fix] in
-            guard let delegate = self?.delegate else { return }
-            delegate.didUpdate(fix)
+        switch fix.source {
+        case .watchOS:
+            latestWatchFix = fix
+        case .iOS:
+            latestPhoneFix = fix
         }
-        transports.forEach { $0.push(fix) }
+
+        let fusedFix: LocationFix?
+        if fusionMode == .weightedAverage {
+            fusedFix = fusedLocation(from: fix)
+        } else {
+            fusedFix = nil
+        }
+
+        let snapshot = RelayUpdate(base: latestPhoneFix, remote: latestWatchFix, fused: fusedFix)
+
+        Task { @MainActor [weak self, snapshot] in
+            guard let delegate = self?.delegate else { return }
+            delegate.didUpdate(snapshot)
+        }
+        currentUpdate = snapshot
+        transports.forEach { $0.push(snapshot) }
         updateHealth()
     }
 
     private func updateHealth() {
         let now = Date()
-        // Relay Health specifically tracks WATCH GPS data quality
-        // Use 10 second window to avoid false "degraded" status due to timer timing jitter
-        if let watchDate = lastWatchFixDate, now.timeIntervalSince(watchDate) <= 10 {
-            health = .streaming
-            return
+        let watchIsFresh: Bool
+        if let watchDate = lastWatchFixDate {
+            watchIsFresh = now.timeIntervalSince(watchDate) <= 10
+        } else {
+            watchIsFresh = false
         }
 
-        // If watch isn't sending, check if we have permissions for fallback
         let status: CLAuthorizationStatus
         if #available(iOS 14.0, *) {
             status = locationManager.authorizationStatus
@@ -296,12 +360,34 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
             status = CLLocationManager.authorizationStatus()
         }
 
+        let servicesEnabled = CLLocationManager.locationServicesEnabled()
+
+        if watchIsFresh {
+            health = .streaming
+            if isAuthorized(status) && canStartLocationAfterAuth && !isPhoneLocationActive {
+                startPhoneLocation()
+            }
+            return
+        }
+
+        if !servicesEnabled {
+            health = .degraded(reason: "Location Services disabled")
+            return
+        }
+
         if status == .denied || status == .restricted {
             health = .degraded(reason: "Location permission denied")
-        } else if lastWatchFixDate == nil {
+            return
+        }
+
+        if lastWatchFixDate == nil {
             health = .degraded(reason: "Awaiting watch GPS")
         } else {
             health = .degraded(reason: "Watch GPS not updating")
+        }
+
+        if isAuthorized(status) && canStartLocationAfterAuth && !isPhoneLocationActive {
+            startPhoneLocation()
         }
     }
 
@@ -351,7 +437,7 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
     private func handleAuthorizationChange(status: CLAuthorizationStatus, accuracy: CLAccuracyAuthorization?) {
         // Ensure health reflects current state when authorization changes
         updateHealth()
-        
+
         switch status {
         case .authorizedAlways, .authorizedWhenInUse:
             if #available(iOS 13.0, *) {
@@ -394,6 +480,7 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
 
     private func startPhoneLocation() {
         guard !isPhoneLocationActive else { return }
+        guard canStartLocationAfterAuth else { return }
         isPhoneLocationActive = true
         if #available(iOS 15.0, *) {
             let session = CLBackgroundActivitySession()
@@ -438,6 +525,72 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
         )
         handleInboundFix(fix)
     }
+
+    private func fusedLocation(from newFix: LocationFix) -> LocationFix {
+        let counterpart: LocationFix?
+        switch newFix.source {
+        case .watchOS:
+            counterpart = latestPhoneFix
+        case .iOS:
+            counterpart = latestWatchFix
+        }
+
+        guard let otherFix = counterpart else {
+            return newFix
+        }
+
+        let now = Date()
+        guard now.timeIntervalSince(otherFix.timestamp) <= fusionWindow else {
+            return newFix
+        }
+
+        let primary = newFix
+        let secondary = otherFix
+
+        let primaryWeight = fusionWeight(for: primary.horizontalAccuracyMeters)
+        let secondaryWeight = fusionWeight(for: secondary.horizontalAccuracyMeters)
+        let totalWeight = primaryWeight + secondaryWeight
+        guard totalWeight > 0 else { return newFix }
+
+        let fusedLatitude = ((primary.coordinate.latitude * primaryWeight) + (secondary.coordinate.latitude * secondaryWeight)) / totalWeight
+        let fusedLongitude = ((primary.coordinate.longitude * primaryWeight) + (secondary.coordinate.longitude * secondaryWeight)) / totalWeight
+
+        let fusedAccuracy = min(primary.horizontalAccuracyMeters, secondary.horizontalAccuracyMeters)
+        let fusedVerticalAccuracy = min(primary.verticalAccuracyMeters, secondary.verticalAccuracyMeters)
+        let fusedAltitude = primary.altitudeMeters ?? secondary.altitudeMeters
+        let fusedSpeed = max(primary.speedMetersPerSecond, secondary.speedMetersPerSecond)
+        let fusedCourse = selectCourse(primary: primary, secondary: secondary)
+        let fusedHeading = primary.headingDegrees ?? secondary.headingDegrees
+
+        return LocationFix(
+            timestamp: primary.timestamp,
+            source: primary.source,
+            coordinate: .init(latitude: fusedLatitude, longitude: fusedLongitude),
+            altitudeMeters: fusedAltitude,
+            horizontalAccuracyMeters: fusedAccuracy,
+            verticalAccuracyMeters: fusedVerticalAccuracy,
+            speedMetersPerSecond: fusedSpeed,
+            courseDegrees: fusedCourse,
+            headingDegrees: fusedHeading,
+            batteryFraction: primary.batteryFraction,
+            sequence: primary.sequence
+        )
+    }
+
+    private func fusionWeight(for accuracy: Double) -> Double {
+        let clamped = max(accuracy, 1)
+        return 1.0 / (clamped * clamped)
+    }
+
+    private func selectCourse(primary: LocationFix, secondary: LocationFix) -> Double {
+        if primary.courseDegrees > 0 {
+            return primary.courseDegrees
+        }
+        if secondary.courseDegrees > 0 {
+            return secondary.courseDegrees
+        }
+        return 0
+    }
 }
 
 extension LocationRelayService: CLLocationManagerDelegate {
@@ -473,6 +626,41 @@ extension LocationRelayService: CLLocationManagerDelegate {
     public func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
         // Store the latest heading for use when publishing location fixes
         currentHeading = newHeading
+
+        // Immediately publish heading update for base station (phone)
+        // This ensures compass heading updates without waiting for GPS location changes
+        let magneticHeading = newHeading.magneticHeading
+        guard !magneticHeading.isNaN else { return }
+
+        Task { [magneticHeading] in
+            await self.publishHeadingUpdate(magneticHeading)
+        }
+    }
+
+    private func publishHeadingUpdate(_ magneticHeading: Double) async {
+        // Only publish if we have a recent phone GPS fix to update
+        guard let baseFix = latestPhoneFix else { return }
+
+        // Create updated fix with same position but new heading
+        let batteryLevel = await MainActor.run {
+            UIDevice.current.batteryLevel >= 0 ? Double(UIDevice.current.batteryLevel) : 0
+        }
+
+        let updatedFix = LocationFix(
+            timestamp: Date(), // Current time for heading update
+            source: .iOS,
+            coordinate: baseFix.coordinate, // Keep same position
+            altitudeMeters: baseFix.altitudeMeters,
+            horizontalAccuracyMeters: baseFix.horizontalAccuracyMeters,
+            verticalAccuracyMeters: baseFix.verticalAccuracyMeters,
+            speedMetersPerSecond: baseFix.speedMetersPerSecond,
+            courseDegrees: baseFix.courseDegrees,
+            headingDegrees: magneticHeading, // Updated heading
+            batteryFraction: batteryLevel,
+            sequence: Int(Int64(Date().timeIntervalSinceReferenceDate * 1000) % Int64(Int.max))
+        )
+
+        handleInboundFix(updatedFix)
     }
 
     public func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
@@ -502,8 +690,9 @@ extension LocationRelayService: WCSessionDelegate {
     }
 
     public func sessionReachabilityDidChange(_ session: WCSession) {
-        isWatchConnected = session.isReachable && session.activationState == .activated
-        updateHealth()
+        if session.isReachable && session.activationState == .activated {
+            isWatchConnected = true
+        }
     }
 
     public func session(_ session: WCSession, didReceiveApplicationContext applicationContext: [String : Any]) {
@@ -540,7 +729,7 @@ extension LocationRelayService: WCSessionDelegate {
 #else
 
 public protocol LocationRelayDelegate: AnyObject {
-    func didUpdate(_ fix: LocationFix)
+    func didUpdate(_ update: RelayUpdate)
     func healthDidChange(_ health: RelayHealth)
     func watchConnectionDidChange(_ isConnected: Bool)
     func authorizationDidFail(_ error: LocationRelayError)
@@ -561,13 +750,10 @@ public final class LocationRelayService {
 
     public func stop() {}
 
-    public func currentFixValue() -> LocationFix? { nil }
+    public func currentSnapshot() -> RelayUpdate? { nil }
 
     public func addTransport(_ transport: LocationTransport) {
         transport.open()
     }
 }
 #endif
-
-
-
