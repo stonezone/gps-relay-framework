@@ -45,14 +45,18 @@ public struct WebSocketTransportConfiguration {
     /// Custom URLSessionConfiguration for advanced TLS settings
     public var sessionConfiguration: URLSessionConfiguration
     
+    /// Allow ws:// connections (primarily for local development). Defaults to false.
+    public var allowInsecureConnections: Bool
+    
     public init(
         maxReconnectAttempts: Int = 10,
         initialBackoffDelay: TimeInterval = 1.0,
         maxBackoffDelay: TimeInterval = 30.0,
-        maxQueueSize: Int = 100,
+        maxQueueSize: Int = 1000,
         customHeaders: [String: String] = [:],
         bearerToken: String? = nil,
-        sessionConfiguration: URLSessionConfiguration = .default
+        sessionConfiguration: URLSessionConfiguration = .default,
+        allowInsecureConnections: Bool = false
     ) {
         self.maxReconnectAttempts = maxReconnectAttempts
         self.initialBackoffDelay = initialBackoffDelay
@@ -61,6 +65,7 @@ public struct WebSocketTransportConfiguration {
         self.customHeaders = customHeaders
         self.bearerToken = bearerToken
         self.sessionConfiguration = sessionConfiguration
+        self.allowInsecureConnections = allowInsecureConnections
     }
 }
 
@@ -196,6 +201,8 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
         
         connectionState = reconnectAttempts > 0 ? .reconnecting : .connecting
         
+        guard validateURLScheme() else { return }
+        
         // Create request with custom headers
         var request = URLRequest(url: url)
         
@@ -218,6 +225,41 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
         NSLog("[WebSocketTransport] Connecting to %@ (attempt %d)", url.absoluteString, reconnectAttempts + 1)
     }
     
+    private func validateURLScheme() -> Bool {
+        guard let scheme = url.scheme?.lowercased() else {
+            reportValidationError(message: "WebSocket URL is missing a scheme (ws:// or wss://)")
+            return false
+        }
+
+        switch scheme {
+        case "wss":
+            return true
+        case "ws":
+            if configuration.allowInsecureConnections {
+                NSLog("[WebSocketTransport] ⚠️ Using insecure ws:// connection to %@", url.absoluteString)
+                return true
+            } else {
+                reportValidationError(message: "Insecure ws:// connections are disabled. Enable allowInsecureConnections for development.")
+                return false
+            }
+        default:
+            reportValidationError(message: "Unsupported WebSocket scheme '\(scheme)'. Use ws:// or wss://.")
+            return false
+        }
+    }
+
+    private func reportValidationError(message: String) {
+        let error = NSError(
+            domain: "WebSocketTransport",
+            code: -1000,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
+        delegate?.webSocketTransport(self, didEncounterError: error)
+        NSLog("[WebSocketTransport] Validation error: %@", message)
+        shouldReconnect = false
+        connectionState = .failed
+    }
+
     private func handleConnectionFailure(error: Error) {
         delegate?.webSocketTransport(self, didEncounterError: error)
         

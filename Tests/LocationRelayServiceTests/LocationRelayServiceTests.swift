@@ -31,9 +31,72 @@ final class MockTransport: LocationTransport {
 
 // MARK: - Mock Delegate
 
+final class MockLocationManager: LocationManagerProtocol {
+    weak var delegate: CLLocationManagerDelegate?
+    var desiredAccuracy: CLLocationAccuracy = kCLLocationAccuracyBest {
+        didSet { desiredAccuracyValues.append(desiredAccuracy) }
+    }
+    var distanceFilter: CLLocationDistance = kCLDistanceFilterNone {
+        didSet { distanceFilterValues.append(distanceFilter) }
+    }
+    var allowsBackgroundLocationUpdates: Bool = false
+
+    private(set) var requestWhenInUseAuthorizationCallCount = 0
+    private(set) var startUpdatingLocationCallCount = 0
+    private(set) var stopUpdatingLocationCallCount = 0
+    private(set) var startUpdatingHeadingCallCount = 0
+    private(set) var stopUpdatingHeadingCallCount = 0
+    private(set) var desiredAccuracyValues: [CLLocationAccuracy] = []
+    private(set) var distanceFilterValues: [CLLocationDistance] = []
+
+    var authorizationStatusStub: CLAuthorizationStatus = .authorizedAlways
+
+    @available(iOS 14.0, *)
+    var authorizationStatus: CLAuthorizationStatus {
+        authorizationStatusStub
+    }
+
+    func requestWhenInUseAuthorization() {
+        requestWhenInUseAuthorizationCallCount += 1
+    }
+
+    func startUpdatingLocation() {
+        startUpdatingLocationCallCount += 1
+    }
+
+    func stopUpdatingLocation() {
+        stopUpdatingLocationCallCount += 1
+    }
+
+    func startUpdatingHeading() {
+        startUpdatingHeadingCallCount += 1
+    }
+
+    func stopUpdatingHeading() {
+        stopUpdatingHeadingCallCount += 1
+    }
+
+    func simulateLocationUpdate(_ location: CLLocation) {
+        delegate?.locationManager?(CLLocationManager(), didUpdateLocations: [location])
+    }
+
+    func simulateError(_ error: Error) {
+        delegate?.locationManager?(CLLocationManager(), didFailWithError: error)
+    }
+
+    func resetAppliedValues() {
+        desiredAccuracyValues.removeAll()
+        distanceFilterValues.removeAll()
+    }
+}
+
+// MARK: - Mock Delegate
+
 final class MockRelayDelegate: LocationRelayDelegate {
     var updatedFixes: [LocationFix] = []
     var healthChanges: [RelayHealth] = []
+    var connectionChanges: [Bool] = []
+    var authorizationFailures: [LocationRelayError] = []
 
     func didUpdate(_ fix: LocationFix) {
         updatedFixes.append(fix)
@@ -41,6 +104,14 @@ final class MockRelayDelegate: LocationRelayDelegate {
 
     func healthDidChange(_ health: RelayHealth) {
         healthChanges.append(health)
+    }
+
+    func watchConnectionDidChange(_ isConnected: Bool) {
+        connectionChanges.append(isConnected)
+    }
+
+    func authorizationDidFail(_ error: LocationRelayError) {
+        authorizationFailures.append(error)
     }
 }
 
@@ -51,10 +122,12 @@ final class LocationRelayServiceTests: XCTestCase {
 
     var service: LocationRelayService!
     var mockDelegate: MockRelayDelegate!
+    var mockLocationManager: MockLocationManager!
 
     override func setUp() {
         super.setUp()
-        service = LocationRelayService()
+        mockLocationManager = MockLocationManager()
+        service = LocationRelayService(locationManager: mockLocationManager)
         mockDelegate = MockRelayDelegate()
         service.delegate = mockDelegate
     }
@@ -63,7 +136,39 @@ final class LocationRelayServiceTests: XCTestCase {
         service.stop()
         service = nil
         mockDelegate = nil
+        mockLocationManager = nil
         super.tearDown()
+    }
+
+    func testInjectedLocationManagerDelegateIsService() {
+        XCTAssertTrue(mockLocationManager.delegate === service)
+        XCTAssertEqual(mockLocationManager.desiredAccuracy, kCLLocationAccuracyNearestTenMeters)
+    }
+
+    func testTrackingModeConfigurationAppliedOnInit() {
+        XCTAssertEqual(mockLocationManager.desiredAccuracyValues.last, kCLLocationAccuracyNearestTenMeters)
+        XCTAssertEqual(mockLocationManager.distanceFilterValues.last, 10.0)
+    }
+
+    func testChangingTrackingModeUpdatesInjectedManager() {
+        mockLocationManager.resetAppliedValues()
+        service.trackingMode = .minimal
+        XCTAssertEqual(mockLocationManager.desiredAccuracy, kCLLocationAccuracyKilometer)
+        XCTAssertEqual(mockLocationManager.distanceFilter, 500.0)
+        XCTAssertEqual(mockLocationManager.desiredAccuracyValues.last, kCLLocationAccuracyKilometer)
+        XCTAssertEqual(mockLocationManager.distanceFilterValues.last, 500.0)
+    }
+
+    func testAuthorizationDeniedNotifiesDelegate() {
+        mockLocationManager.authorizationStatusStub = .denied
+        let expectation = XCTestExpectation(description: "Authorization failure delivered")
+        service.start()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            if self?.mockDelegate.authorizationFailures.contains(.authorizationDenied) == true {
+                expectation.fulfill()
+            }
+        }
+        wait(for: [expectation], timeout: 1.0)
     }
 
     // MARK: - Watch Silence Fallback Tests (TODO.md Section 3, Task 8.1)
@@ -302,6 +407,40 @@ final class LocationRelayServiceTests: XCTestCase {
         }
 
         XCTAssertNil(fix.altitudeMeters)
+    }
+
+    func testPhoneLocationWithPoorAccuracyIsRejected() {
+        service.start()
+        let initialCount = mockDelegate.updatedFixes.count
+        let inaccurateLocation = createCLLocation(
+            latitude: 0,
+            longitude: 0,
+            altitude: 0,
+            horizontalAccuracy: 200, // Worse than balanced threshold (50m)
+            verticalAccuracy: 8,
+            speed: 1,
+            course: 0,
+            timestamp: Date()
+        )
+        simulatePhoneLocation(inaccurateLocation)
+        XCTAssertEqual(mockDelegate.updatedFixes.count, initialCount, "Inaccurate locations should be filtered out")
+    }
+
+    func testPhoneLocationWithStaleTimestampIsRejected() {
+        service.start()
+        let initialCount = mockDelegate.updatedFixes.count
+        let staleLocation = createCLLocation(
+            latitude: 0,
+            longitude: 0,
+            altitude: 0,
+            horizontalAccuracy: 20,
+            verticalAccuracy: 8,
+            speed: 1,
+            course: 0,
+            timestamp: Date().addingTimeInterval(-30)
+        )
+        simulatePhoneLocation(staleLocation)
+        XCTAssertEqual(mockDelegate.updatedFixes.count, initialCount, "Stale locations should be filtered out")
     }
 
     // MARK: - WatchConnectivity State Handling Tests (TODO.md Section 3, Task 8.4)
@@ -935,14 +1074,11 @@ final class LocationRelayServiceTests: XCTestCase {
     }
 
     private func simulatePhoneLocation(_ location: CLLocation) {
-        // Access the service's CLLocationManagerDelegate conformance
-        let manager = CLLocationManager()
-        service.locationManager(manager, didUpdateLocations: [location])
+        mockLocationManager.simulateLocationUpdate(location)
     }
 
     private func simulateLocationManagerError(_ error: Error) {
-        let manager = CLLocationManager()
-        service.locationManager(manager, didFailWithError: error)
+        mockLocationManager.simulateError(error)
     }
 
     private func simulateWatchSessionActivation(state: WCSessionActivationState, error: Error?) {

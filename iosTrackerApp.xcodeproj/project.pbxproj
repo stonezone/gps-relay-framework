@@ -354,6 +354,8 @@
 				INFOPLIST_KEY_CFBundleDisplayName = watchTrackerApp;
 				INFOPLIST_KEY_NSHealthShareUsageDescription = "This app needs to access your heart rate data to track workout intensity during GPS tracking sessions.";
 				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "This app needs to save workout data to track your GPS tracking sessions.";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "GPS tracking for relay to iPhone and Jetson";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "GPS tracking for relay to iPhone and Jetson";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
 				INFOPLIST_KEY_WKCompanionAppBundleIdentifier = com.iostracker.iosapp;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -389,6 +391,8 @@
 				INFOPLIST_KEY_CFBundleDisplayName = watchTrackerApp;
 				INFOPLIST_KEY_NSHealthShareUsageDescription = "This app needs to access your heart rate data to track workout intensity during GPS tracking sessions.";
 				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "This app needs to save workout data to track your GPS tracking sessions.";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "GPS tracking for relay to iPhone and Jetson";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "GPS tracking for relay to iPhone and Jetson";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
 				INFOPLIST_KEY_WKCompanionAppBundleIdentifier = com.iostracker.iosapp;
 				LD_RUNPATH_SEARCH_PATHS = (

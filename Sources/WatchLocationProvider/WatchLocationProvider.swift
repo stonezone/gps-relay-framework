@@ -31,10 +31,16 @@ public final class WatchLocationProvider: NSObject {
     public func startWorkoutAndStreaming(activity: HKWorkoutActivityType = .other) {
         requestAuthorizationsIfNeeded()
         startWorkoutSession(activity: activity)
+        // Extended runtime session requires special entitlement - omitting for now
+        // The workout session itself keeps the app active
         configureWatchConnectivity()
-        locationManager.activityType = .fitness
+
+        // Configure for maximum update frequency
+        locationManager.activityType = .other  // .other provides most frequent updates
         locationManager.desiredAccuracy = kCLLocationAccuracyBest
         locationManager.distanceFilter = kCLDistanceFilterNone
+        // watchOS doesn't need allowsBackgroundLocationUpdates - the workout session handles this
+
         locationManager.startUpdatingLocation()
     }
 
@@ -50,7 +56,9 @@ public final class WatchLocationProvider: NSObject {
             readTypes.insert(heartRate)
         }
         workoutStore.requestAuthorization(toShare: [], read: readTypes) { _, _ in }
-        locationManager.requestWhenInUseAuthorization()
+
+        // Request Always authorization for background location updates
+        locationManager.requestAlwaysAuthorization()
     }
 
     private func startWorkoutSession(activity: HKWorkoutActivityType) {
@@ -68,8 +76,11 @@ public final class WatchLocationProvider: NSObject {
 
     private func configureWatchConnectivity() {
         if WCSession.isSupported() {
+            print("[WatchLocationProvider] Activating WCSession")
             wcSession.delegate = self
             wcSession.activate()
+        } else {
+            print("[WatchLocationProvider] WCSession not supported")
         }
     }
 
@@ -80,21 +91,42 @@ public final class WatchLocationProvider: NSObject {
             print("[WatchLocationProvider] Session not activated")
             return
         }
-        guard wcSession.isReachable else {
-            print("[WatchLocationProvider] Session not reachable, using background transfer")
+
+        // Always update application context for latest fix (works in background)
+        updateApplicationContextWithFix(fix)
+
+        // Try interactive messaging first if reachable
+        if wcSession.isReachable {
+            do {
+                let data = try encoder.encode(fix)
+                print("[WatchLocationProvider] Sending interactive message (\(data.count) bytes)")
+                wcSession.sendMessageData(data, replyHandler: nil) { [weak self] error in
+                    print("[WatchLocationProvider] Interactive send failed: \(error.localizedDescription), falling back to file transfer")
+                    // Retry via background transfer on failure
+                    self?.queueBackgroundTransfer(for: fix)
+                }
+            } catch {
+                print("[WatchLocationProvider] Encode error: \(error.localizedDescription)")
+                delegate?.didFail(error)
+                queueBackgroundTransfer(for: fix)
+            }
+        } else {
+            // Not reachable, use background transfer as backup
+            print("[WatchLocationProvider] Not reachable, using file transfer")
             queueBackgroundTransfer(for: fix)
-            return
         }
+    }
+
+    private func updateApplicationContextWithFix(_ fix: LocationFix) {
+        guard wcSession.activationState == .activated else { return }
         do {
             let data = try encoder.encode(fix)
-            print("[WatchLocationProvider] Sending message data (\(data.count) bytes)")
-            wcSession.sendMessageData(data, replyHandler: nil) { [weak self] error in
-                print("[WatchLocationProvider] Send failed: \(error.localizedDescription)")
-                self?.delegate?.didFail(error)
-            }
+            let context = ["latestFix": data]
+            try wcSession.updateApplicationContext(context)
+            print("[WatchLocationProvider] Updated application context with latest fix")
         } catch {
-            print("[WatchLocationProvider] Encode error: \(error.localizedDescription)")
-            delegate?.didFail(error)
+            print("[WatchLocationProvider] Failed to update context: \(error.localizedDescription)")
+            // Non-fatal, other methods will still deliver
         }
     }
 
@@ -105,6 +137,7 @@ public final class WatchLocationProvider: NSObject {
             let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try data.write(to: url)
             wcSession.transferFile(url, metadata: nil)
+            print("[WatchLocationProvider] Queued file transfer")
         } catch {
             delegate?.didFail(error)
         }
@@ -138,6 +171,7 @@ extension WatchLocationProvider: CLLocationManagerDelegate {
 
 extension WatchLocationProvider: WCSessionDelegate {
     public func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
+        print("[WatchLocationProvider] WCSession activation completed with state: \(activationState.rawValue), error: \(error?.localizedDescription ?? "none")")
         if let error {
             delegate?.didFail(error)
         }
@@ -152,6 +186,7 @@ extension WatchLocationProvider: WCSessionDelegate {
     public func session(_ session: WCSession, didReceive file: WCSessionFile) {}
 #endif
 }
+
 #else
 
 public protocol WatchLocationProviderDelegate: AnyObject {

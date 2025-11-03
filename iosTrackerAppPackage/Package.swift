@@ -22,9 +22,9 @@ let package = Package(
         .target(
             name: "iosTrackerAppFeature",
             dependencies: [
-                .product(name: "LocationCore", package: "iosTracker_class"),
-                .product(name: "LocationRelayService", package: "iosTracker_class"),
-                .product(name: "WebSocketTransport", package: "iosTracker_class")
+                .product(name: "LocationCore", package: "gps-relay-framework"),
+                .product(name: "LocationRelayService", package: "gps-relay-framework"),
+                .product(name: "WebSocketTransport", package: "gps-relay-framework")
             ]
         ),
         .testTarget(

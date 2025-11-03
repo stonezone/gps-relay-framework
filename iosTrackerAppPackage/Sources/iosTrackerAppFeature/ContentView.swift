@@ -4,28 +4,22 @@ import LocationCore
 public struct ContentView: View {
     @StateObject private var viewModel = LocationRelayViewModel()
 
+    public init() {}
+
     public var body: some View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 24) {
-                    // MARK: - Relay Control Section
                     relayControlSection
-
-                    // MARK: - WebSocket Configuration Section
+                    trackingModeSection
                     webSocketConfigSection
-
-                    // MARK: - Current GPS Fix Section
+                    connectionStatusSection
                     currentFixSection
-
-                    // MARK: - Relay Health Section
                     relayHealthSection
-
-                    // MARK: - Watch Connection Section
                     watchConnectionSection
 
                     Spacer()
 
-                    // MARK: - Version Footer
                     Text("v1.0.0")
                         .font(.caption2)
                         .foregroundColor(.secondary)
@@ -35,24 +29,26 @@ public struct ContentView: View {
             }
             .navigationTitle("iOS Tracker")
         }
+        .alert(
+            viewModel.authorizationMessage ?? "",
+            isPresented: Binding(
+                get: { viewModel.authorizationMessage != nil },
+                set: { if !$0 { viewModel.dismissAuthorizationMessage() } }
+            )
+        ) {
+            Button("OK", role: .cancel) {
+                viewModel.dismissAuthorizationMessage()
+            }
+        }
     }
 
-    // MARK: - VERSION UPDATE NOTE
-    // When making changes to the app, update the version number above:
-    // - Patch (x.x.X): Bug fixes, minor tweaks
-    // - Minor (x.X.x): New features, UI changes
-    // - Major (X.x.x): Breaking changes, major refactors
+    // MARK: - Relay Control
 
-    // MARK: - Relay Control Section
     private var relayControlSection: some View {
         VStack(spacing: 12) {
-            Button(action: {
-                if viewModel.isRelayActive {
-                    viewModel.stopRelay()
-                } else {
-                    viewModel.startRelay()
-                }
-            }) {
+            Button {
+                viewModel.isRelayActive ? viewModel.stopRelay() : viewModel.startRelay()
+            } label: {
                 HStack {
                     Image(systemName: viewModel.isRelayActive ? "stop.circle.fill" : "play.circle.fill")
                         .font(.title2)
@@ -69,27 +65,47 @@ public struct ContentView: View {
             Text(viewModel.statusMessage)
                 .font(.subheadline)
                 .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
         }
     }
 
-    // MARK: - WebSocket Configuration Section
-    private var webSocketConfigSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Jetson WebSocket URL")
+    // MARK: - Tracking Modes
+
+    private var trackingModeSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Tracking Mode")
                 .font(.headline)
 
-            HStack {
-                Image(systemName: "network")
-                    .foregroundColor(.blue)
-                TextField("ws://192.168.55.1:8765", text: $viewModel.webSocketURL)
-                    .textFieldStyle(RoundedBorderTextFieldStyle())
-                    .autocapitalization(.none)
-                    .keyboardType(.URL)
-                    .disabled(viewModel.isRelayActive)
+            ForEach(TrackingMode.allCases, id: \.self) { mode in
+                Button {
+                    viewModel.trackingMode = mode
+                } label: {
+                    HStack {
+                        Image(systemName: viewModel.trackingMode == mode ? "checkmark.circle.fill" : "circle")
+                            .foregroundColor(viewModel.trackingMode == mode ? .green : .gray)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(modeDisplayName(mode))
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            Text(mode.configuration.description)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Text(String(format: "~%.0f%%/hr", mode.configuration.estimatedBatteryUsePerHour))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(12)
+                    .background(viewModel.trackingMode == mode ? Color.green.opacity(0.15) : Color.clear)
+                    .cornerRadius(10)
+                }
+                .buttonStyle(.plain)
+                .disabled(viewModel.isRelayActive)
             }
 
             if viewModel.isRelayActive {
-                Text("Stop relay to change URL")
+                Text("Stop tracking to change mode.")
                     .font(.caption)
                     .foregroundColor(.orange)
             }
@@ -99,7 +115,66 @@ public struct ContentView: View {
         .cornerRadius(12)
     }
 
-    // MARK: - Current GPS Fix Section
+    // MARK: - WebSocket Configuration
+
+    private var webSocketConfigSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Jetson WebSocket")
+                .font(.headline)
+
+            HStack {
+                Image(systemName: "network")
+                    .foregroundColor(.blue)
+                TextField("ws://192.168.55.1:8765", text: $viewModel.webSocketURL)
+                    .textFieldStyle(.roundedBorder)
+                    .autocapitalization(.none)
+                    .keyboardType(.URL)
+                    .disabled(viewModel.isRelayActive)
+            }
+
+            Toggle(isOn: $viewModel.allowInsecureConnections) {
+                Text("Allow insecure ws:// connections")
+                    .font(.subheadline)
+            }
+            .tint(.orange)
+            .disabled(viewModel.isRelayActive)
+
+            Text("Use wss:// for production. ws:// is intended for local testing on trusted networks.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            if viewModel.isRelayActive {
+                Text("Stop relay to edit connection settings.")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            }
+        }
+        .padding()
+        .background(Color(.systemGray6))
+        .cornerRadius(12)
+    }
+
+    // MARK: - Connection Status
+
+    private var connectionStatusSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Connection Status")
+                .font(.headline)
+            HStack {
+                Image(systemName: connectionIconName)
+                    .foregroundColor(connectionStatusColor)
+                Text(connectionStatusText)
+                    .font(.subheadline)
+                Spacer()
+            }
+        }
+        .padding()
+        .background(Color(.systemGray6))
+        .cornerRadius(12)
+    }
+
+    // MARK: - Current Fix
+
     private var currentFixSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -127,7 +202,7 @@ public struct ContentView: View {
                     fixDetailRow(label: "Speed", value: String(format: "%.1f m/s", fix.speedMetersPerSecond))
                 }
             } else {
-                Text("No GPS fix available")
+                Text("No GPS fix yet.")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -139,12 +214,12 @@ public struct ContentView: View {
         .cornerRadius(12)
     }
 
-    // MARK: - watchTracker GPS Section
+    // MARK: - Relay Health
+
     private var relayHealthSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("watchTracker GPS")
+            Text("Watch GPS Stream")
                 .font(.headline)
-
             HStack {
                 Circle()
                     .fill(healthStatusColor)
@@ -159,16 +234,17 @@ public struct ContentView: View {
         .cornerRadius(12)
     }
 
-    // MARK: - watchTrackerApp Connection Section
+    // MARK: - Watch Connection
+
     private var watchConnectionSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("watchTrackerApp Connection")
+            Text("watchTracker Connectivity")
                 .font(.headline)
 
             HStack {
                 Image(systemName: viewModel.isWatchConnected ? "applewatch" : "applewatch.slash")
                     .foregroundColor(viewModel.isWatchConnected ? .green : .gray)
-                Text(viewModel.isWatchConnected ? "Connected" : "Not Connected")
+                Text(viewModel.isWatchConnected ? "Connected" : "Awaiting watch")
                     .font(.subheadline)
                 Spacer()
             }
@@ -179,6 +255,7 @@ public struct ContentView: View {
     }
 
     // MARK: - Helper Views
+
     private func fixDetailRow(label: String, value: String) -> some View {
         HStack {
             Text(label)
@@ -191,7 +268,12 @@ public struct ContentView: View {
         }
     }
 
-    // MARK: - Computed Properties
+    private func formatTimestamp(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+
     private var healthStatusColor: Color {
         switch viewModel.relayHealth {
         case .idle:
@@ -209,17 +291,58 @@ public struct ContentView: View {
             return "Idle"
         case .streaming:
             return "Streaming"
-        case .degraded:
-            return "Degraded"
+        case .degraded(let reason):
+            return "Degraded – \(reason)"
         }
     }
 
-    // MARK: - Helper Methods
-    private func formatTimestamp(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        return formatter.string(from: date)
+    private var connectionStatusColor: Color {
+        switch viewModel.connectionState {
+        case .connected:
+            return .green
+        case .connecting, .reconnecting:
+            return .orange
+        case .failed:
+            return .red
+        case .disconnected:
+            return .gray
+        }
     }
 
-    public init() {}
+    private var connectionStatusText: String {
+        switch viewModel.connectionState {
+        case .connected:
+            return "Connected"
+        case .connecting:
+            return "Connecting…"
+        case .reconnecting:
+            return "Reconnecting…"
+        case .failed:
+            return "Failed"
+        case .disconnected:
+            return "Disconnected"
+        }
+    }
+
+    private var connectionIconName: String {
+        switch viewModel.connectionState {
+        case .connected:
+            return "checkmark.seal.fill"
+        case .connecting, .reconnecting:
+            return "arrow.triangle.2.circlepath"
+        case .failed:
+            return "exclamationmark.triangle.fill"
+        case .disconnected:
+            return "xmark.seal"
+        }
+    }
+
+    private func modeDisplayName(_ mode: TrackingMode) -> String {
+        switch mode {
+        case .realtime: return "Real-Time"
+        case .balanced: return "Balanced"
+        case .powersaver: return "Power Saver"
+        case .minimal: return "Minimal"
+        }
+    }
 }

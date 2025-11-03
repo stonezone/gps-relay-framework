@@ -29,7 +29,7 @@ let package = Package(
         ),
         .target(
             name: "LocationRelayService",
-            dependencies: ["LocationCore"],
+            dependencies: ["LocationCore", "WebSocketTransport"],
             path: "Sources/LocationRelayService"
         ),
         .target(

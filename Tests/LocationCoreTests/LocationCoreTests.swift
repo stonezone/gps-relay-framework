@@ -12,6 +12,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 8.0,
             speedMetersPerSecond: 1.2,
             courseDegrees: 87,
+            headingDegrees: nil,
             batteryFraction: 0.76,
             sequence: 1_042
         )
@@ -32,6 +33,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 0,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -48,6 +50,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 0,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -64,6 +67,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 8.3,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -84,6 +88,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 100
         )
@@ -97,6 +102,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 101
         )
@@ -110,6 +116,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 102
         )
@@ -130,6 +137,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 12345
         )
@@ -153,6 +161,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -196,6 +205,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -219,6 +229,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 8.0,
             speedMetersPerSecond: 1.2,
             courseDegrees: 87,
+            headingDegrees: nil,
             batteryFraction: 0.76,
             sequence: 1_042
         )
@@ -249,6 +260,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -269,6 +281,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 8.0,
             speedMetersPerSecond: 1.2,
             courseDegrees: 87,
+            headingDegrees: nil,
             batteryFraction: 0.76,
             sequence: 1_042
         )
@@ -291,6 +304,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -311,6 +325,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -331,6 +346,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -348,6 +364,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 2
         )
@@ -369,6 +386,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -383,6 +401,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 2
         )
@@ -405,6 +424,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -419,6 +439,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 2
         )
@@ -441,6 +462,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -455,6 +477,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 360,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 2
         )
@@ -477,6 +500,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0,
             sequence: 1
         )
@@ -491,6 +515,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 1,
             sequence: 2
         )
@@ -513,6 +538,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 0,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -535,6 +561,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 0,
             courseDegrees: 0,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
@@ -555,6 +582,7 @@ final class LocationCoreTests: XCTestCase {
             verticalAccuracyMeters: 5,
             speedMetersPerSecond: 300.5,
             courseDegrees: 180,
+            headingDegrees: nil,
             batteryFraction: 0.5,
             sequence: 1
         )
