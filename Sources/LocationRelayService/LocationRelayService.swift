@@ -182,6 +182,13 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
         decoder.dateDecodingStrategy = .millisecondsSince1970
         return decoder
     }()
+    private let decoderLock = NSLock()
+
+    private func decodeFix(from data: Data) -> LocationFix? {
+        decoderLock.lock()
+        defer { decoderLock.unlock() }
+        return try? decoder.decode(LocationFix.self, from: data)
+    }
     private var lastWatchFixDate: Date?
     private var currentHeading: CLHeading?  // Track latest compass heading
     private var transports: [LocationTransport] = []
@@ -198,6 +205,14 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
     private var isWatchConnected: Bool = false {
         didSet {
             guard oldValue != isWatchConnected else { return }
+            
+            // Track connectivity transitions
+            connectivityTransitions += 1
+            
+            // Log transition with structured prefix
+            let transitionType = isWatchConnected ? "CONNECTED" : "DISCONNECTED"
+            print("[CONNECTIVITY] Watch \(transitionType) (transition #\(connectivityTransitions))")
+            
             let newState = isWatchConnected
             Task { @MainActor [weak self, newState] in
                 guard let delegate = self?.delegate else { return }
@@ -214,6 +229,47 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
     private var latestPhoneFix: LocationFix?
     private let fusionWindow: TimeInterval = 5
     private var lastSequenceBySource: [LocationFix.Source: Int] = [:]
+
+    private struct PendingWatchMessage {
+        let id: UUID
+        let data: Data
+        var retryCount: Int
+        let firstFailureDate: Date
+    }
+
+    private let watchRetryQueue = DispatchQueue(label: "com.iostracker.locationRelay.watchRetryQueue")
+    private var pendingWatchMessages: [UUID: PendingWatchMessage] = [:]
+    private var pendingRetryWorkItems: [UUID: DispatchWorkItem] = [:]
+    private let maxPendingMessages = 100
+    private let maxPendingMessageAge: TimeInterval = 45
+    private let baseRetryDelay: TimeInterval = 0.5
+    private let maxRetryDelay: TimeInterval = 5
+    private let maxWatchRetryAttempts = 3
+
+    private var phoneSpeedSamples: [Double] = []
+    private let phoneSpeedWindowSize = 12
+    private var isInLowPowerMode = false
+
+    private var fixTimestampsBySource: [LocationFix.Source: [Date]] = [:]
+    private let healthWindow: TimeInterval = 10
+    private var lastHealthLogTime: Date?
+
+    // MARK: - Telemetry Metrics (Phase 4.2)
+    
+    /// Total number of duplicate fixes detected and rejected
+    private(set) var duplicateFixCount: Int = 0
+    
+    /// Total number of watch messages dropped (all reasons)
+    private(set) var totalDroppedMessages: Int = 0
+    
+    /// Categorized drop counts by reason
+    private(set) var dropReasons: [String: Int] = [:]
+    
+    /// Peak queue depth observed during session
+    private(set) var peakQueueDepth: Int = 0
+    
+    /// Total number of watch connectivity transitions (connect/disconnect events)
+    private(set) var connectivityTransitions: Int = 0
 
     public enum FusionMode: Sendable {
         case disabled
@@ -248,6 +304,18 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
 
     public func start() {
         canStartLocationAfterAuth = true
+        resetWatchRetryState()
+        phoneSpeedSamples.removeAll()
+        isInLowPowerMode = false
+        fixTimestampsBySource.removeAll()
+
+        // Reset telemetry metrics for new session
+        duplicateFixCount = 0
+        totalDroppedMessages = 0
+        dropReasons.removeAll()
+        peakQueueDepth = 0
+        connectivityTransitions = 0
+
         requestAuthorizations()
         transports.forEach { $0.open() }
         if CLLocationManager.locationServicesEnabled(), isAuthorized(currentAuthorizationStatus()), !isPhoneLocationActive {
@@ -267,6 +335,13 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
         latestPhoneFix = nil
         currentUpdate = nil
         lastSequenceBySource.removeAll()
+        resetWatchRetryState()
+        phoneSpeedSamples.removeAll()
+        isInLowPowerMode = false
+        fixTimestampsBySource.removeAll()
+
+        // Reset metrics (keep values for telemetry access until next start)
+        // Note: Metrics are NOT reset here to allow post-session telemetry access
     }
 
     public func currentSnapshot() -> RelayUpdate? {
@@ -307,14 +382,29 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
     }
 
     private func handleInboundFix(_ fix: LocationFix) {
-        // Deduplicate repeated sequences from retries/background transfers
-        if let lastSeq = lastSequenceBySource[fix.source], lastSeq == fix.sequence {
-            print("[LocationRelayService] Ignoring duplicate fix for \(fix.source) seq=\(fix.sequence)")
+        let timeSkew = fix.timestamp.timeIntervalSinceNow
+        if timeSkew > 15 {
+            print("[LocationRelayService] Dropped fix seq=\(fix.sequence) due to future timestamp (+\(String(format: "%.1f", timeSkew))s)")
             return
+        }
+
+        if fix.source == .watchOS && !shouldAcceptWatchFix(fix) {
+            print("[LocationRelayService] Rejected watch fix seq=\(fix.sequence) due to quality thresholds")
+            return
+        }
+
+        if let lastSeq = lastSequenceBySource[fix.source] {
+            if lastSeq == fix.sequence {
+                duplicateFixCount += 1
+                print("[DEDUPE] Duplicate fix rejected for \(fix.source) seq=\(fix.sequence) (total duplicates: \(duplicateFixCount))")
+                return
+            }
+            if fix.source == .watchOS && fix.sequence > lastSeq + 1 {
+                print("[LocationRelayService] Warning: gap detected in watch sequences (last=\(lastSeq), current=\(fix.sequence))")
+            }
         }
         lastSequenceBySource[fix.source] = fix.sequence
 
-        // Track watch fixes separately from phone fixes using reception time
         if fix.source == .watchOS {
             lastWatchFixDate = Date()
         }
@@ -325,6 +415,8 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
         case .iOS:
             latestPhoneFix = fix
         }
+
+        recordFixTimestamp(for: fix.source)
 
         let fusedFix: LocationFix?
         if fusionMode == .weightedAverage {
@@ -342,6 +434,7 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
         currentUpdate = snapshot
         transports.forEach { $0.push(snapshot) }
         updateHealth()
+        logStreamHealthIfNeeded(reason: "fix seq=\(fix.sequence)")
     }
 
     private func updateHealth() {
@@ -461,17 +554,34 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
     }
 
     private func shouldAccept(_ location: CLLocation) -> Bool {
-        let thresholds = activeQualityThresholds
-        // Reject invalid accuracy readings
-        guard location.horizontalAccuracy >= 0 else { return false }
-        guard location.horizontalAccuracy <= thresholds.maxHorizontalAccuracy else { return false }
+        return shouldAccept(location, for: .iOS)
+    }
 
-        // Reject stale samples
+    private func shouldAccept(_ location: CLLocation, for source: LocationFix.Source) -> Bool {
+        let thresholds = activeQualityThresholds
+        guard location.horizontalAccuracy >= 0 else { return false }
+
+        let accuracyLimit = source == .iOS ? thresholds.maxHorizontalAccuracy * 2 : thresholds.maxHorizontalAccuracy
+        guard location.horizontalAccuracy <= accuracyLimit else { return false }
+
         let age = abs(location.timestamp.timeIntervalSinceNow)
         guard age <= thresholds.maxAge else { return false }
 
-        // Reject teleportation-level speeds (if speed is valid)
-        if location.speed >= 0 && location.speed > thresholds.maxSpeed {
+        if source == .watchOS, location.speed >= 0, location.speed > thresholds.maxSpeed {
+            return false
+        }
+
+        return true
+    }
+
+    private func shouldAcceptWatchFix(_ fix: LocationFix) -> Bool {
+        let thresholds = activeQualityThresholds
+        guard fix.horizontalAccuracyMeters <= thresholds.maxHorizontalAccuracy else { return false }
+
+        let age = abs(fix.timestamp.timeIntervalSinceNow)
+        guard age <= thresholds.maxAge else { return false }
+
+        if fix.speedMetersPerSecond >= 0, fix.speedMetersPerSecond > thresholds.maxSpeed {
             return false
         }
 
@@ -506,24 +616,294 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
     }
 
     private func publishPhoneLocation(_ location: CLLocation) async {
-        let batteryLevel = await MainActor.run {
-            UIDevice.current.batteryLevel >= 0 ? Double(UIDevice.current.batteryLevel) : 0
+        await MainActor.run {
+            guard self.shouldAccept(location, for: .iOS) else {
+                #if DEBUG
+                print("[LocationRelayService] Phone fix rejected during publish phase")
+                #endif
+                return
+            }
+
+            let batteryLevel = UIDevice.current.batteryLevel >= 0 ? Double(UIDevice.current.batteryLevel) : 0
+
+            let fix = LocationFix(
+                timestamp: location.timestamp,
+                source: .iOS,
+                coordinate: .init(latitude: location.coordinate.latitude, longitude: location.coordinate.longitude),
+                altitudeMeters: location.verticalAccuracy >= 0 ? location.altitude : nil,
+                horizontalAccuracyMeters: location.horizontalAccuracy,
+                verticalAccuracyMeters: max(location.verticalAccuracy, 0),
+                speedMetersPerSecond: max(location.speed, 0),
+                courseDegrees: location.course >= 0 ? location.course : 0,
+                headingDegrees: self.currentHeading?.magneticHeading.isNaN == false ? self.currentHeading?.magneticHeading : nil,
+                batteryFraction: batteryLevel,
+                sequence: Int(Int64(Date().timeIntervalSinceReferenceDate * 1000) % Int64(Int.max))
+            )
+            self.handleInboundFix(fix)
+            self.updateBaseStationMotionState(with: location, generatedFix: fix)
         }
-        
-        let fix = LocationFix(
-            timestamp: location.timestamp,
-            source: .iOS,
-            coordinate: .init(latitude: location.coordinate.latitude, longitude: location.coordinate.longitude),
-            altitudeMeters: location.verticalAccuracy >= 0 ? location.altitude : nil,
-            horizontalAccuracyMeters: location.horizontalAccuracy,
-            verticalAccuracyMeters: max(location.verticalAccuracy, 0),
-            speedMetersPerSecond: max(location.speed, 0),
-            courseDegrees: location.course >= 0 ? location.course : 0,
-            headingDegrees: currentHeading?.magneticHeading.isNaN == false ? currentHeading?.magneticHeading : nil,
-            batteryFraction: batteryLevel,
-            sequence: Int(Int64(Date().timeIntervalSinceReferenceDate * 1000) % Int64(Int.max))
+    }
+
+    private func updateBaseStationMotionState(with location: CLLocation, generatedFix fix: LocationFix) {
+        let speed = max(location.speed, 0)
+        phoneSpeedSamples.append(speed)
+        if phoneSpeedSamples.count > phoneSpeedWindowSize {
+            phoneSpeedSamples.removeFirst(phoneSpeedSamples.count - phoneSpeedWindowSize)
+        }
+
+        let averageSpeed = phoneSpeedSamples.reduce(0, +) / Double(phoneSpeedSamples.count)
+        let stationaryEntryThreshold: Double = 0.5
+        let stationaryExitThreshold: Double = 1.5
+
+        if !isInLowPowerMode && averageSpeed < stationaryEntryThreshold {
+            enterBaseStationLowPowerMode()
+        } else if isInLowPowerMode && averageSpeed > stationaryExitThreshold {
+            exitBaseStationLowPowerMode()
+        }
+
+        // Ensure heading updates resume when movement detected
+        if !isInLowPowerMode, CLLocationManager.headingAvailable() {
+            locationManager.startUpdatingHeading()
+        }
+    }
+
+    private func enterBaseStationLowPowerMode() {
+        guard !isInLowPowerMode else { return }
+        isInLowPowerMode = true
+        print("[LocationRelayService] Entering base-station low power mode")
+        locationManager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+        locationManager.distanceFilter = 20
+        if CLLocationManager.headingAvailable() {
+            locationManager.stopUpdatingHeading()
+        }
+    }
+
+    private func exitBaseStationLowPowerMode() {
+        guard isInLowPowerMode else { return }
+        isInLowPowerMode = false
+        print("[LocationRelayService] Exiting base-station low power mode")
+        applyTrackingMode()
+        if CLLocationManager.headingAvailable() {
+            locationManager.startUpdatingHeading()
+        }
+    }
+
+    private func recordFixTimestamp(for source: LocationFix.Source) {
+        let now = Date()
+        var timestamps = fixTimestampsBySource[source] ?? []
+        timestamps.append(now)
+        timestamps = timestamps.filter { now.timeIntervalSince($0) <= healthWindow }
+        fixTimestampsBySource[source] = timestamps
+    }
+
+    private func resetWatchRetryState() {
+        watchRetryQueue.async { [weak self] in
+            guard let self else { return }
+            self.pendingRetryWorkItems.values.forEach { $0.cancel() }
+            self.pendingRetryWorkItems.removeAll()
+            self.pendingWatchMessages.removeAll()
+        }
+    }
+
+    private func handleIncomingWatchMessage(_ data: Data) {
+        watchRetryQueue.async { [weak self] in
+            guard let self else { return }
+            if let fix = self.decodeFix(from: data) {
+                DispatchQueue.main.async {
+                    self.handleInboundFix(fix)
+                }
+            } else {
+                self.enqueuePendingWatchMessage(data)
+            }
+        }
+    }
+
+    private func enqueuePendingWatchMessage(_ data: Data) {
+        if pendingWatchMessages.count >= maxPendingMessages {
+            if let oldest = pendingWatchMessages.values.min(by: { $0.firstFailureDate < $1.firstFailureDate }) {
+                dropPendingWatchMessage(oldest, reason: "queue capacity")
+            }
+        }
+
+        let message = PendingWatchMessage(id: UUID(), data: data, retryCount: 0, firstFailureDate: Date())
+        pendingWatchMessages[message.id] = message
+
+        // Track queue depth metrics
+        let queueDepth = pendingWatchMessages.count
+        if queueDepth > peakQueueDepth {
+            peakQueueDepth = queueDepth
+        }
+
+        print("[QUEUE] Enqueued watch message (depth: \(queueDepth), peak: \(peakQueueDepth))")
+        scheduleRetry(for: message)
+    }
+
+    private func scheduleRetry(for message: PendingWatchMessage) {
+        pendingRetryWorkItems[message.id]?.cancel()
+        let delay = min(baseRetryDelay * pow(2, Double(message.retryCount)), maxRetryDelay)
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.retryPendingMessage(id: message.id)
+        }
+        pendingRetryWorkItems[message.id] = workItem
+        watchRetryQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func retryPendingMessage(id: UUID) {
+        guard var message = pendingWatchMessages[id] else { return }
+        pendingRetryWorkItems[id]?.cancel()
+        pendingRetryWorkItems[id] = nil
+
+        let age = Date().timeIntervalSince(message.firstFailureDate)
+        if age > maxPendingMessageAge {
+            dropPendingWatchMessage(message, reason: "stale (age=\(String(format: "%.1f", age))s)")
+            return
+        }
+
+        message.retryCount += 1
+
+        if let fix = decodeFix(from: message.data) {
+            pendingWatchMessages.removeValue(forKey: id)
+            DispatchQueue.main.async {
+                self.handleInboundFix(fix)
+            }
+            return
+        }
+
+        if message.retryCount >= maxWatchRetryAttempts {
+            dropPendingWatchMessage(message, reason: "max retries reached")
+            return
+        }
+
+        pendingWatchMessages[id] = message
+        scheduleRetry(for: message)
+    }
+
+    private func dropPendingWatchMessage(_ message: PendingWatchMessage, reason: String) {
+        pendingRetryWorkItems[message.id]?.cancel()
+        pendingRetryWorkItems.removeValue(forKey: message.id)
+        pendingWatchMessages.removeValue(forKey: message.id)
+
+        // Track drop statistics
+        totalDroppedMessages += 1
+        dropReasons[reason, default: 0] += 1
+
+        let queueDepth = pendingWatchMessages.count
+        print("[DROP] Watch message dropped after \(message.retryCount) retries, reason: \(reason) (total drops: \(totalDroppedMessages), queue depth: \(queueDepth))")
+    }
+
+    private func flushPendingWatchMessages() {
+        watchRetryQueue.async { [weak self] in
+            guard let self else { return }
+            let pendingIDs = Array(self.pendingWatchMessages.keys)
+            pendingIDs.forEach { self.retryPendingMessage(id: $0) }
+        }
+    }
+
+    public struct StreamHealth {
+        public struct FixHealth {
+            public let isActive: Bool
+            public let lastUpdateAge: TimeInterval?
+            public let updateRate: Double
+            public let signalQuality: Double
+        }
+
+        public let base: FixHealth
+        public let remote: FixHealth
+        public let overall: RelayHealth
+    }
+
+    public func streamHealthSnapshot(window: TimeInterval = 10) -> StreamHealth {
+        let now = Date()
+        let baseTimestamps = fixTimestampsBySource[.iOS] ?? []
+        let remoteTimestamps = fixTimestampsBySource[.watchOS] ?? []
+
+        let baseAge = latestPhoneFix.map { now.timeIntervalSince($0.timestamp) }
+        let remoteAge = latestWatchFix.map { now.timeIntervalSince($0.timestamp) }
+
+        let baseHealth = StreamHealth.FixHealth(
+            isActive: isPhoneLocationActive,
+            lastUpdateAge: baseAge,
+            updateRate: Double(baseTimestamps.count) / window,
+            signalQuality: signalQuality(for: latestPhoneFix, age: baseAge)
         )
-        handleInboundFix(fix)
+
+        let remoteHealth = StreamHealth.FixHealth(
+            isActive: isWatchConnected,
+            lastUpdateAge: remoteAge,
+            updateRate: Double(remoteTimestamps.count) / window,
+            signalQuality: signalQuality(for: latestWatchFix, age: remoteAge)
+        )
+
+        let overall: RelayHealth
+        switch (baseHealth.isActive, remoteHealth.isActive) {
+        case (true, true):
+            overall = .streaming
+        case (false, false):
+            overall = .idle
+        default:
+            overall = .degraded(reason: "Single stream active")
+        }
+
+        return StreamHealth(base: baseHealth, remote: remoteHealth, overall: overall)
+    }
+
+    private func signalQuality(for fix: LocationFix?, age: TimeInterval?) -> Double {
+        guard let fix else { return 0 }
+        let accuracyScore = max(0, 1.0 - (fix.horizontalAccuracyMeters / 100.0))
+        let ageScore = age.map { max(0, 1.0 - ($0 / 30.0)) } ?? 0
+        return (accuracyScore + ageScore) / 2.0
+    }
+
+    // MARK: - Telemetry Access (Phase 4.2)
+
+    /// Snapshot of telemetry metrics for monitoring and debugging
+    public struct TelemetryMetrics {
+        /// Total duplicate fixes detected and rejected during session
+        public let duplicateFixCount: Int
+
+        /// Total watch messages dropped during session
+        public let totalDroppedMessages: Int
+
+        /// Breakdown of drop reasons with counts
+        public let dropReasons: [String: Int]
+
+        /// Current retry queue depth
+        public let currentQueueDepth: Int
+
+        /// Peak retry queue depth observed during session
+        public let peakQueueDepth: Int
+
+        /// Total connectivity state transitions (connect/disconnect events)
+        public let connectivityTransitions: Int
+    }
+
+    /// Returns current telemetry metrics snapshot
+    /// - Returns: Current metrics for logging and telemetry systems
+    public func telemetrySnapshot() -> TelemetryMetrics {
+        return TelemetryMetrics(
+            duplicateFixCount: duplicateFixCount,
+            totalDroppedMessages: totalDroppedMessages,
+            dropReasons: dropReasons,
+            currentQueueDepth: pendingWatchMessages.count,
+            peakQueueDepth: peakQueueDepth,
+            connectivityTransitions: connectivityTransitions
+        )
+    }
+
+    private func logStreamHealthIfNeeded(reason: String? = nil) {
+        let now = Date()
+        if let last = lastHealthLogTime, now.timeIntervalSince(last) < 5 {
+            return
+        }
+        lastHealthLogTime = now
+        let snapshot = streamHealthSnapshot(window: healthWindow)
+        let queueDepth = pendingWatchMessages.count
+        print("""
+[HEALTH] Base: \(snapshot.base.isActive ? "✅" : "⚠️") age=\(snapshot.base.lastUpdateAge.map { String(format: "%.1fs", $0) } ?? "—") rate=\(String(format: "%.2f/s", snapshot.base.updateRate)) quality=\(String(format: "%.2f", snapshot.base.signalQuality))
+[HEALTH] Remote: \(snapshot.remote.isActive ? "✅" : "⚠️") age=\(snapshot.remote.lastUpdateAge.map { String(format: "%.1fs", $0) } ?? "—") rate=\(String(format: "%.2f/s", snapshot.remote.updateRate)) quality=\(String(format: "%.2f", snapshot.remote.signalQuality))
+[HEALTH] Overall: \(snapshot.overall)\(reason.map { " // " + $0 } ?? "")
+[HEALTH] Metrics: queue=\(queueDepth) peak=\(peakQueueDepth) drops=\(totalDroppedMessages) dupes=\(duplicateFixCount) transitions=\(connectivityTransitions)
+""")
     }
 
     private func fusedLocation(from newFix: LocationFix) -> LocationFix {
@@ -638,29 +1018,27 @@ extension LocationRelayService: CLLocationManagerDelegate {
     }
 
     private func publishHeadingUpdate(_ magneticHeading: Double) async {
-        // Only publish if we have a recent phone GPS fix to update
-        guard let baseFix = latestPhoneFix else { return }
+        await MainActor.run {
+            guard let baseFix = self.latestPhoneFix else { return }
 
-        // Create updated fix with same position but new heading
-        let batteryLevel = await MainActor.run {
-            UIDevice.current.batteryLevel >= 0 ? Double(UIDevice.current.batteryLevel) : 0
+            let batteryLevel = UIDevice.current.batteryLevel >= 0 ? Double(UIDevice.current.batteryLevel) : 0
+
+            let updatedFix = LocationFix(
+                timestamp: Date(),
+                source: .iOS,
+                coordinate: baseFix.coordinate,
+                altitudeMeters: baseFix.altitudeMeters,
+                horizontalAccuracyMeters: baseFix.horizontalAccuracyMeters,
+                verticalAccuracyMeters: baseFix.verticalAccuracyMeters,
+                speedMetersPerSecond: baseFix.speedMetersPerSecond,
+                courseDegrees: baseFix.courseDegrees,
+                headingDegrees: magneticHeading,
+                batteryFraction: batteryLevel,
+                sequence: Int(Int64(Date().timeIntervalSinceReferenceDate * 1000) % Int64(Int.max))
+            )
+
+            self.handleInboundFix(updatedFix)
         }
-
-        let updatedFix = LocationFix(
-            timestamp: Date(), // Current time for heading update
-            source: .iOS,
-            coordinate: baseFix.coordinate, // Keep same position
-            altitudeMeters: baseFix.altitudeMeters,
-            horizontalAccuracyMeters: baseFix.horizontalAccuracyMeters,
-            verticalAccuracyMeters: baseFix.verticalAccuracyMeters,
-            speedMetersPerSecond: baseFix.speedMetersPerSecond,
-            courseDegrees: baseFix.courseDegrees,
-            headingDegrees: magneticHeading, // Updated heading
-            batteryFraction: batteryLevel,
-            sequence: Int(Int64(Date().timeIntervalSinceReferenceDate * 1000) % Int64(Int.max))
-        )
-
-        handleInboundFix(updatedFix)
     }
 
     public func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
@@ -692,6 +1070,7 @@ extension LocationRelayService: WCSessionDelegate {
     public func sessionReachabilityDidChange(_ session: WCSession) {
         if session.isReachable && session.activationState == .activated {
             isWatchConnected = true
+            flushPendingWatchMessages()
         }
     }
 
@@ -699,7 +1078,7 @@ extension LocationRelayService: WCSessionDelegate {
         print("[LocationRelayService] Received application context update")
         isWatchConnected = true  // We just received context, so watch is connected
         guard let data = applicationContext["latestFix"] as? Data,
-              let fix = try? decoder.decode(LocationFix.self, from: data) else {
+              let fix = decodeFix(from: data) else {
             print("[LocationRelayService] Failed to decode fix from context")
             return
         }
@@ -710,17 +1089,12 @@ extension LocationRelayService: WCSessionDelegate {
     public func session(_ session: WCSession, didReceiveMessageData messageData: Data) {
         print("[LocationRelayService] Received message data: \(messageData.count) bytes")
         isWatchConnected = true  // We just received data, so watch is definitely connected
-        guard let fix = try? decoder.decode(LocationFix.self, from: messageData) else {
-            print("[LocationRelayService] Failed to decode LocationFix")
-            return
-        }
-        print("[LocationRelayService] Decoded fix: lat=\(fix.coordinate.latitude), lon=\(fix.coordinate.longitude)")
-        handleInboundFix(fix)
+        handleIncomingWatchMessage(messageData)
     }
 
     public func session(_ session: WCSession, didReceive file: WCSessionFile) {
         isWatchConnected = true  // We just received a file, so watch is connected
-        guard let data = try? Data(contentsOf: file.fileURL), let fix = try? decoder.decode(LocationFix.self, from: data) else {
+        guard let data = try? Data(contentsOf: file.fileURL), let fix = decodeFix(from: data) else {
             return
         }
         handleInboundFix(fix)

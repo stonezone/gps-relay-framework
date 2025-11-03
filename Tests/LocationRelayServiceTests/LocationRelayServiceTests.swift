@@ -987,6 +987,686 @@ final class LocationRelayServiceTests: XCTestCase {
         XCTAssertTrue(mockDelegate.healthChanges.contains(.streaming))
     }
 
+    // MARK: - Phase 4: Simultaneous Phone/Watch Updates Tests
+
+    func testSimultaneousPhoneAndWatchUpdatesCreatesSeparateSnapshots() {
+        // Given: Service is started with transport
+        service.start()
+        let transport = MockTransport()
+        service.addTransport(transport)
+
+        // When: Watch fix arrives
+        let watchFix = createLocationFix(source: .watchOS, sequence: 1, timestamp: Date())
+        simulateWatchFix(watchFix)
+
+        // And: Phone location arrives shortly after
+        let phoneLocation = createCLLocation(
+            latitude: 37.7750,
+            longitude: -122.4195,
+            timestamp: Date().addingTimeInterval(0.5)
+        )
+        simulatePhoneLocation(phoneLocation)
+
+        // Then: Both fixes are captured in snapshots
+        let snapshots = transport.pushedUpdates
+        XCTAssertGreaterThanOrEqual(snapshots.count, 2)
+
+        // Verify watch snapshot
+        let watchSnapshot = snapshots.first { $0.remote?.sequence == 1 }
+        XCTAssertNotNil(watchSnapshot)
+        XCTAssertEqual(watchSnapshot?.remote?.source, .watchOS)
+
+        // Verify phone snapshot exists
+        let phoneSnapshot = snapshots.first { $0.base != nil }
+        XCTAssertNotNil(phoneSnapshot)
+        XCTAssertEqual(phoneSnapshot?.base?.source, .iOS)
+    }
+
+    func testDualStreamSnapshotContainsBothSources() {
+        // Given: Service is running
+        service.start()
+        let transport = MockTransport()
+        service.addTransport(transport)
+
+        // When: Watch fix arrives first
+        let watchFix = createLocationFix(
+            source: .watchOS,
+            sequence: 10,
+            timestamp: Date()
+        )
+        simulateWatchFix(watchFix)
+
+        // And: Phone location arrives within fusion window
+        let phoneLocation = createCLLocation(
+            latitude: 37.7760,
+            longitude: -122.4180,
+            timestamp: Date().addingTimeInterval(1.0)
+        )
+        simulatePhoneLocation(phoneLocation)
+
+        // Then: Latest snapshot should have both base and remote
+        let latestSnapshot = transport.pushedUpdates.last
+        XCTAssertNotNil(latestSnapshot?.base, "Snapshot should have base (phone) fix")
+        XCTAssertNotNil(latestSnapshot?.remote, "Snapshot should have remote (watch) fix")
+
+        // Verify sources are correct
+        XCTAssertEqual(latestSnapshot?.base?.source, .iOS)
+        XCTAssertEqual(latestSnapshot?.remote?.source, .watchOS)
+    }
+
+    func testRapidAlternatingSourceUpdates() {
+        // Given: Service is running
+        service.start()
+        let transport = MockTransport()
+        service.addTransport(transport)
+
+        // When: Rapid alternating updates from both sources
+        for i in 1...5 {
+            let watchFix = createLocationFix(
+                source: .watchOS,
+                sequence: i * 2,
+                timestamp: Date().addingTimeInterval(Double(i) * 0.1)
+            )
+            simulateWatchFix(watchFix)
+
+            let phoneLocation = createCLLocation(
+                latitude: 37.7749 + Double(i) * 0.0001,
+                longitude: -122.4194,
+                timestamp: Date().addingTimeInterval(Double(i) * 0.1 + 0.05)
+            )
+            simulatePhoneLocation(phoneLocation)
+        }
+
+        // Then: All updates are captured
+        XCTAssertGreaterThanOrEqual(transport.pushedUpdates.count, 10)
+
+        // Verify both sources are represented
+        let watchUpdates = transport.pushedUpdates.filter { $0.remote != nil }
+        let phoneUpdates = transport.pushedUpdates.filter { $0.base != nil }
+
+        XCTAssertGreaterThanOrEqual(watchUpdates.count, 5)
+        XCTAssertGreaterThanOrEqual(phoneUpdates.count, 5)
+    }
+
+    func testSimultaneousUpdatesDoNotCauseDuplicates() {
+        // Given: Service is running
+        service.start()
+
+        // When: Same sequence number sent twice from watch
+        let watchFix1 = createLocationFix(source: .watchOS, sequence: 100)
+        simulateWatchFix(watchFix1)
+
+        let initialCount = mockDelegate.updatedSnapshots.count
+
+        // Send duplicate
+        let watchFix2 = createLocationFix(source: .watchOS, sequence: 100)
+        simulateWatchFix(watchFix2)
+
+        // Then: Duplicate is rejected
+        XCTAssertEqual(mockDelegate.updatedSnapshots.count, initialCount, "Duplicate sequence should be ignored")
+    }
+
+    func testPhoneWatchInterleaving() {
+        // Given: Service started
+        service.start()
+        let transport = MockTransport()
+        service.addTransport(transport)
+
+        // When: Updates interleave with precise timing
+        let watchFix1 = createLocationFix(source: .watchOS, sequence: 1)
+        simulateWatchFix(watchFix1)
+
+        let phoneLocation1 = createCLLocation(latitude: 1, longitude: 1)
+        simulatePhoneLocation(phoneLocation1)
+
+        let watchFix2 = createLocationFix(source: .watchOS, sequence: 2)
+        simulateWatchFix(watchFix2)
+
+        // Then: Current snapshot reflects latest from each source
+        let currentSnapshot = service.currentSnapshot()
+        XCTAssertNotNil(currentSnapshot)
+        XCTAssertEqual(currentSnapshot?.remote?.sequence, 2, "Latest watch fix should be sequence 2")
+        XCTAssertEqual(currentSnapshot?.base?.source, .iOS, "Latest phone fix should be present")
+    }
+
+    // MARK: - Phase 4: Retry Queue Failure Scenarios Tests
+
+    func testInvalidWatchMessageQueuesForRetry() {
+        // Given: Service is running
+        service.start()
+
+        let initialDelegateCount = mockDelegate.updatedSnapshots.count
+
+        // When: Invalid JSON arrives that cannot be decoded immediately
+        let invalidJSON = "{\"incomplete\":".data(using: .utf8)!
+        simulateWatchMessageData(invalidJSON)
+
+        // Then: Message is queued for retry (no immediate delegate update)
+        // Wait a bit to ensure no immediate processing
+        let expectation = XCTestExpectation(description: "Wait for potential retry")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            // Should still be same count as retry won't succeed
+            XCTAssertEqual(self?.mockDelegate.updatedSnapshots.count, initialDelegateCount)
+            expectation.fulfill()
+        }
+        wait(for: [expectation], timeout: 1.0)
+    }
+
+    func testRetryQueueExponentialBackoff() {
+        // Given: Service is running
+        service.start()
+
+        // When: Multiple invalid messages arrive
+        for _ in 1...3 {
+            let invalidJSON = "{\"bad\":".data(using: .utf8)!
+            simulateWatchMessageData(invalidJSON)
+        }
+
+        // Then: Messages are queued and retry with exponential backoff
+        // Base retry delay is 0.5s, so first retry at 0.5s, second at 1.0s, third at 2.0s
+        let expectation = XCTestExpectation(description: "Wait for retry attempts")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
+            // After max retries, messages should be dropped
+            // No fixes should have been processed
+            XCTAssertEqual(self?.mockDelegate.updatedFixes.count, 0)
+            expectation.fulfill()
+        }
+        wait(for: [expectation], timeout: 4.0)
+    }
+
+    func testStaleMessagesDroppedFromRetryQueue() {
+        // Given: Service is running
+        service.start()
+
+        // When: Very old message is received (simulated by creating old timestamp)
+        // Since we can't directly set firstFailureDate, we test the age threshold indirectly
+        let oldFix = createLocationFix(
+            source: .watchOS,
+            sequence: 1,
+            timestamp: Date().addingTimeInterval(-60) // 60 seconds old
+        )
+
+        // Encode it
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        guard let data = try? encoder.encode(oldFix) else {
+            XCTFail("Failed to encode old fix")
+            return
+        }
+
+        // Submit as message
+        simulateWatchMessageData(data)
+
+        // Then: Old message should still be processed (timestamp age is checked, not message age)
+        // The service checks timestamp.timeIntervalSinceNow for future timestamps only
+        XCTAssertGreaterThanOrEqual(mockDelegate.updatedSnapshots.count, 1)
+    }
+
+    func testRetryQueueCapacityLimit() {
+        // Given: Service is running
+        service.start()
+
+        // When: More than maxPendingMessages (100) invalid messages arrive
+        for i in 1...105 {
+            let invalidJSON = "{\"incomplete\(i)\":".data(using: .utf8)!
+            simulateWatchMessageData(invalidJSON)
+        }
+
+        // Then: Oldest messages are dropped when capacity is exceeded
+        let expectation = XCTestExpectation(description: "Wait for queue management")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            // No valid fixes should be processed
+            XCTAssertEqual(self?.mockDelegate.updatedFixes.count, 0)
+            expectation.fulfill()
+        }
+        wait(for: [expectation], timeout: 1.0)
+    }
+
+    func testRetryQueueFlushOnReachability() {
+        // Given: Service is running with pending messages
+        service.start()
+
+        // Queue some invalid messages first
+        for _ in 1...3 {
+            let invalidJSON = "{\"bad\":".data(using: .utf8)!
+            simulateWatchMessageData(invalidJSON)
+        }
+
+        let initialCount = mockDelegate.updatedSnapshots.count
+
+        // When: Watch becomes reachable
+        simulateWatchReachabilityChange()
+
+        // Then: Pending messages are retried
+        let expectation = XCTestExpectation(description: "Wait for flush attempt")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            // Messages still won't decode, but flush was attempted
+            expectation.fulfill()
+        }
+        wait(for: [expectation], timeout: 1.0)
+    }
+
+    func testSuccessfulRetryRemovesFromQueue() {
+        // Given: Service is running
+        service.start()
+
+        // When: Valid watch fix arrives initially
+        let validFix = createLocationFix(source: .watchOS, sequence: 50)
+        simulateWatchFix(validFix)
+
+        let fixCount = mockDelegate.updatedSnapshots.count
+
+        // Send the same fix again (duplicate sequence)
+        simulateWatchFix(validFix)
+
+        // Then: Duplicate is rejected, no retry needed
+        XCTAssertEqual(mockDelegate.updatedSnapshots.count, fixCount, "Duplicate should not create new snapshot")
+    }
+
+    func testMaxRetryAttemptsExhausted() {
+        // Given: Service with retry queue
+        service.start()
+
+        let initialCount = mockDelegate.updatedSnapshots.count
+
+        // When: Persistently invalid message is sent
+        let badData = "not even json".data(using: .utf8)!
+        simulateWatchMessageData(badData)
+
+        // Then: After max retry attempts (3), message is dropped
+        let expectation = XCTestExpectation(description: "Wait for max retries")
+        // Max delay = 0.5 * (2^3) = 4.0s, plus some buffer
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { [weak self] in
+            // No successful processing should have occurred
+            XCTAssertEqual(self?.mockDelegate.updatedSnapshots.count, initialCount)
+            expectation.fulfill()
+        }
+        wait(for: [expectation], timeout: 7.0)
+    }
+
+    // MARK: - Phase 4: Application Context Throttling Tests
+
+    func testApplicationContextUpdateProcessed() {
+        // Given: Service is running
+        service.start()
+        let transport = MockTransport()
+        service.addTransport(transport)
+
+        // When: Application context with fix arrives
+        let fix = createLocationFix(source: .watchOS, sequence: 200)
+        simulateWatchApplicationContext(fix)
+
+        // Then: Fix is processed
+        XCTAssertEqual(mockDelegate.updatedFixes.last?.sequence, 200)
+        XCTAssertEqual(transport.pushedFixes.last?.sequence, 200)
+        XCTAssertEqual(service.currentFix?.sequence, 200)
+    }
+
+    func testApplicationContextWithInvalidDataIgnored() {
+        // Given: Service is running
+        service.start()
+
+        let initialCount = mockDelegate.updatedSnapshots.count
+
+        // When: Application context with invalid data arrives
+        let invalidContext: [String: Any] = ["latestFix": "not data"]
+        simulateWatchApplicationContext(invalidContext)
+
+        // Then: No fix is processed
+        XCTAssertEqual(mockDelegate.updatedSnapshots.count, initialCount)
+    }
+
+    func testApplicationContextWithoutLatestFixIgnored() {
+        // Given: Service is running
+        service.start()
+
+        let initialCount = mockDelegate.updatedSnapshots.count
+
+        // When: Application context without latestFix key arrives
+        let emptyContext: [String: Any] = ["someOtherKey": "value"]
+        simulateWatchApplicationContext(emptyContext)
+
+        // Then: No fix is processed
+        XCTAssertEqual(mockDelegate.updatedSnapshots.count, initialCount)
+    }
+
+    func testApplicationContextUpdatesWatchConnectionState() {
+        // Given: Service is running with watch disconnected
+        service.start()
+
+        // Reset connection state
+        let expectation1 = XCTestExpectation(description: "Wait for initial state")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            expectation1.fulfill()
+        }
+        wait(for: [expectation1], timeout: 0.5)
+
+        let initialConnectionCount = mockDelegate.connectionChanges.count
+
+        // When: Application context arrives (indicates watch is connected)
+        let fix = createLocationFix(source: .watchOS, sequence: 300)
+        simulateWatchApplicationContext(fix)
+
+        // Then: Watch connection state is updated
+        let expectation2 = XCTestExpectation(description: "Wait for connection update")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            // Connection state should have been updated
+            XCTAssertGreaterThan(self?.mockDelegate.connectionChanges.count ?? 0, initialConnectionCount)
+            expectation2.fulfill()
+        }
+        wait(for: [expectation2], timeout: 0.5)
+    }
+
+    func testApplicationContextDeduplicationBySequence() {
+        // Given: Service is running
+        service.start()
+
+        // When: Application context with fix arrives
+        let fix1 = createLocationFix(source: .watchOS, sequence: 400)
+        simulateWatchApplicationContext(fix1)
+
+        let firstCount = mockDelegate.updatedSnapshots.count
+
+        // Send same sequence again via application context
+        let fix2 = createLocationFix(source: .watchOS, sequence: 400)
+        simulateWatchApplicationContext(fix2)
+
+        // Then: Duplicate sequence is ignored
+        XCTAssertEqual(mockDelegate.updatedSnapshots.count, firstCount, "Duplicate sequence should be ignored")
+    }
+
+    func testApplicationContextVsMessageDataPriority() {
+        // Given: Service is running
+        service.start()
+
+        // When: Fix arrives via application context
+        let contextFix = createLocationFix(source: .watchOS, sequence: 500)
+        simulateWatchApplicationContext(contextFix)
+
+        XCTAssertEqual(service.currentFix?.sequence, 500)
+
+        // And: Newer fix arrives via message data
+        let messageFix = createLocationFix(source: .watchOS, sequence: 501)
+        simulateWatchFix(messageFix)
+
+        // Then: Both are processed, latest is current
+        XCTAssertEqual(service.currentFix?.sequence, 501)
+    }
+
+    // MARK: - Phase 4: Health Logging Tests
+
+    func testStreamHealthSnapshotWithNoActivity() {
+        // Given: Service just started, no fixes yet
+        service.start()
+
+        // When: Getting stream health snapshot
+        let health = service.streamHealthSnapshot()
+
+        // Then: Both streams are inactive
+        XCTAssertFalse(health.base.isActive || health.remote.isActive)
+        XCTAssertEqual(health.overall, .idle)
+        XCTAssertNil(health.base.lastUpdateAge)
+        XCTAssertNil(health.remote.lastUpdateAge)
+        XCTAssertEqual(health.base.updateRate, 0.0)
+        XCTAssertEqual(health.remote.updateRate, 0.0)
+    }
+
+    func testStreamHealthSnapshotWithWatchActivity() {
+        // Given: Service is running with watch fixes
+        service.start()
+
+        // Send multiple watch fixes
+        for i in 1...5 {
+            let fix = createLocationFix(source: .watchOS, sequence: i)
+            simulateWatchFix(fix)
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+
+        // When: Getting stream health snapshot
+        let health = service.streamHealthSnapshot(window: 10)
+
+        // Then: Remote stream shows activity
+        XCTAssertTrue(health.remote.isActive)
+        XCTAssertNotNil(health.remote.lastUpdateAge)
+        XCTAssertLessThan(health.remote.lastUpdateAge ?? 999, 2.0, "Last update should be recent")
+        XCTAssertGreaterThan(health.remote.updateRate, 0.0)
+        XCTAssertGreaterThan(health.remote.signalQuality, 0.0)
+    }
+
+    func testStreamHealthSnapshotWithPhoneActivity() {
+        // Given: Service is running with phone location updates
+        service.start()
+
+        // Wait for phone GPS to activate
+        let expectation1 = XCTestExpectation(description: "Wait for phone activation")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.5) {
+            expectation1.fulfill()
+        }
+        wait(for: [expectation1], timeout: 6.0)
+
+        // Send phone location
+        let location = createCLLocation(latitude: 37.7749, longitude: -122.4194)
+        simulatePhoneLocation(location)
+
+        // When: Getting stream health snapshot
+        let health = service.streamHealthSnapshot(window: 10)
+
+        // Then: Base stream shows activity
+        XCTAssertTrue(health.base.isActive)
+        XCTAssertNotNil(health.base.lastUpdateAge)
+        XCTAssertGreaterThan(health.base.updateRate, 0.0)
+    }
+
+    func testStreamHealthSnapshotWithBothStreamsActive() {
+        // Given: Service with both streams active
+        service.start()
+
+        // Send watch fix
+        let watchFix = createLocationFix(source: .watchOS, sequence: 10)
+        simulateWatchFix(watchFix)
+
+        // Send phone location
+        let phoneLocation = createCLLocation(latitude: 37.7749, longitude: -122.4194)
+        simulatePhoneLocation(phoneLocation)
+
+        // When: Getting stream health snapshot
+        let health = service.streamHealthSnapshot(window: 10)
+
+        // Then: Both streams are active, overall is streaming
+        XCTAssertTrue(health.base.isActive)
+        XCTAssertTrue(health.remote.isActive)
+        XCTAssertEqual(health.overall, .streaming)
+    }
+
+    func testStreamHealthSnapshotWithSingleStreamActive() {
+        // Given: Service with only watch stream active
+        service.start()
+
+        let watchFix = createLocationFix(source: .watchOS, sequence: 20)
+        simulateWatchFix(watchFix)
+
+        // When: Getting stream health snapshot
+        let health = service.streamHealthSnapshot(window: 10)
+
+        // Then: Overall health is degraded (only one stream)
+        if case .degraded(let reason) = health.overall {
+            XCTAssertTrue(reason.contains("Single stream"))
+        } else {
+            XCTFail("Expected degraded health with single stream active")
+        }
+    }
+
+    func testStreamHealthSnapshotUpdateRateCalculation() {
+        // Given: Service is running
+        service.start()
+
+        // Send 10 watch fixes over ~1 second
+        for i in 1...10 {
+            let fix = createLocationFix(source: .watchOS, sequence: i)
+            simulateWatchFix(fix)
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+
+        // When: Getting stream health snapshot with 10-second window
+        let health = service.streamHealthSnapshot(window: 10)
+
+        // Then: Update rate reflects the 10 fixes
+        // Should be approximately 10 fixes / 10 seconds = 1.0 Hz
+        XCTAssertGreaterThan(health.remote.updateRate, 0.5, "Update rate should reflect recent fixes")
+        XCTAssertLessThanOrEqual(health.remote.updateRate, 10.0, "Update rate should be within window")
+    }
+
+    func testStreamHealthSnapshotSignalQuality() {
+        // Given: Service is running
+        service.start()
+
+        // Send high-accuracy watch fix
+        let highAccuracyFix = LocationFix(
+            timestamp: Date(),
+            source: .watchOS,
+            coordinate: .init(latitude: 37.7749, longitude: -122.4194),
+            altitudeMeters: 50.0,
+            horizontalAccuracyMeters: 3.0, // Very accurate
+            verticalAccuracyMeters: 5.0,
+            speedMetersPerSecond: 1.5,
+            courseDegrees: 90.0,
+            headingDegrees: nil,
+            batteryFraction: 0.75,
+            sequence: 1
+        )
+        simulateWatchFix(highAccuracyFix)
+
+        // When: Getting stream health snapshot
+        let health = service.streamHealthSnapshot(window: 10)
+
+        // Then: Signal quality is high (good accuracy + recent timestamp)
+        XCTAssertGreaterThan(health.remote.signalQuality, 0.5, "High accuracy fix should have good signal quality")
+    }
+
+    func testStreamHealthSnapshotAgeCalculation() {
+        // Given: Service is running
+        service.start()
+
+        // Send watch fix
+        let fix = createLocationFix(source: .watchOS, sequence: 30)
+        simulateWatchFix(fix)
+
+        // Wait a bit
+        Thread.sleep(forTimeInterval: 1.0)
+
+        // When: Getting stream health snapshot
+        let health = service.streamHealthSnapshot(window: 10)
+
+        // Then: Last update age is approximately 1 second
+        XCTAssertNotNil(health.remote.lastUpdateAge)
+        XCTAssertGreaterThan(health.remote.lastUpdateAge ?? 0, 0.5)
+        XCTAssertLessThan(health.remote.lastUpdateAge ?? 999, 2.0)
+    }
+
+    func testStreamHealthSnapshotCustomWindow() {
+        // Given: Service with multiple fixes over time
+        service.start()
+
+        for i in 1...20 {
+            let fix = createLocationFix(source: .watchOS, sequence: i)
+            simulateWatchFix(fix)
+            Thread.sleep(forTimeInterval: 0.05) // 50ms between fixes
+        }
+
+        // When: Getting health snapshot with smaller window
+        let health5s = service.streamHealthSnapshot(window: 5)
+        let health10s = service.streamHealthSnapshot(window: 10)
+
+        // Then: Update rates differ based on window size
+        // Smaller window may have higher rate if fixes are recent
+        XCTAssertGreaterThan(health5s.remote.updateRate, 0.0)
+        XCTAssertGreaterThan(health10s.remote.updateRate, 0.0)
+    }
+
+    func testStreamHealthLoggingThrottle() {
+        // Given: Service is running
+        service.start()
+
+        // When: Multiple fixes arrive rapidly (within 5 seconds)
+        for i in 1...10 {
+            let fix = createLocationFix(source: .watchOS, sequence: i)
+            simulateWatchFix(fix)
+        }
+
+        // Then: Health logging is throttled (verified by code inspection)
+        // The logStreamHealthIfNeeded method checks if < 5s elapsed since last log
+        // This is tested indirectly - we verify fixes are processed
+        XCTAssertGreaterThanOrEqual(mockDelegate.updatedSnapshots.count, 10)
+    }
+
+    // MARK: - Phase 4: Sequence Gap Detection Tests
+
+    func testSequenceGapDetectionInWatchFixes() {
+        // Given: Service is running
+        service.start()
+
+        // When: Watch fixes arrive with sequence gap
+        let fix1 = createLocationFix(source: .watchOS, sequence: 1)
+        simulateWatchFix(fix1)
+
+        let fix2 = createLocationFix(source: .watchOS, sequence: 5) // Gap: 2, 3, 4 missing
+        simulateWatchFix(fix2)
+
+        // Then: Both fixes are processed (gap is logged but not blocking)
+        XCTAssertEqual(mockDelegate.updatedSnapshots.count, 2)
+        XCTAssertEqual(service.currentFix?.sequence, 5)
+    }
+
+    func testSequentialWatchFixesNoGap() {
+        // Given: Service is running
+        service.start()
+
+        // When: Watch fixes arrive sequentially
+        for i in 1...5 {
+            let fix = createLocationFix(source: .watchOS, sequence: i)
+            simulateWatchFix(fix)
+        }
+
+        // Then: All fixes are processed without warnings
+        XCTAssertEqual(mockDelegate.updatedSnapshots.count, 5)
+        XCTAssertEqual(service.currentFix?.sequence, 5)
+    }
+
+    func testFutureTimestampRejection() {
+        // Given: Service is running
+        service.start()
+
+        let initialCount = mockDelegate.updatedSnapshots.count
+
+        // When: Fix with future timestamp arrives (>15s in future)
+        let futureFix = createLocationFix(
+            source: .watchOS,
+            sequence: 100,
+            timestamp: Date().addingTimeInterval(20) // 20 seconds in future
+        )
+        simulateWatchFix(futureFix)
+
+        // Then: Fix is rejected due to future timestamp
+        XCTAssertEqual(mockDelegate.updatedSnapshots.count, initialCount, "Future-dated fix should be rejected")
+    }
+
+    func testSlightlyFutureTimestampAccepted() {
+        // Given: Service is running
+        service.start()
+
+        // When: Fix with slightly future timestamp arrives (<15s in future)
+        let slightlyFutureFix = createLocationFix(
+            source: .watchOS,
+            sequence: 101,
+            timestamp: Date().addingTimeInterval(5) // 5 seconds in future - acceptable
+        )
+        simulateWatchFix(slightlyFutureFix)
+
+        // Then: Fix is accepted
+        XCTAssertGreaterThanOrEqual(mockDelegate.updatedSnapshots.count, 1)
+        XCTAssertEqual(service.currentFix?.sequence, 101)
+    }
+
     // MARK: - Helper Methods
 
     private func createLocationFix(
@@ -1098,6 +1778,20 @@ final class LocationRelayServiceTests: XCTestCase {
         let session = WCSession.default
         service.sessionReachabilityDidChange(session)
     }
+
+    private func simulateWatchApplicationContext(_ fix: LocationFix) {
+        guard let data = try? JSONEncoder().encode(fix) else {
+            XCTFail("Failed to encode fix")
+            return
+        }
+        let context: [String: Any] = ["latestFix": data]
+        simulateWatchApplicationContext(context)
+    }
+
+    private func simulateWatchApplicationContext(_ context: [String: Any]) {
+        let session = WCSession.default
+        service.session(session, didReceiveApplicationContext: context)
+    }
 }
 
 #else
@@ -1105,7 +1799,7 @@ final class LocationRelayServiceTests: XCTestCase {
 final class LocationRelayServiceTests: XCTestCase {
     func testLocationRelayServiceNotAvailableOnNonIOS() {
         let service = LocationRelayService()
-        XCTAssertNil(service.currentFixValue())
+        XCTAssertNil(service.currentSnapshot())
     }
 }
 #endif

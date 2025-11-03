@@ -21,7 +21,7 @@ public struct ContentView: View {
 
                     Spacer()
 
-                    Text("v1.0.2")
+                    Text("v1.0.3")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                         .padding(.bottom, 8)

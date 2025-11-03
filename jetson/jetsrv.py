@@ -116,6 +116,8 @@ async def handler(ws: websockets.WebSocketServerProtocol) -> None:
     """
     LOGGER.info("client connected from %s", ws.remote_address)
     _clients.add(ws)
+    stream_counts = {"iOS": 0, "watchOS": 0}
+
     try:
         async for message in ws:
             # Parse JSON
@@ -140,18 +142,30 @@ async def handler(ws: websockets.WebSocketServerProtocol) -> None:
                 continue
 
             # Valid fix - log and process
+            source = fix.get("source", "unknown")
+            if source in stream_counts:
+                stream_counts[source] += 1
+
             LOGGER.info(
-                "valid fix received: source=%s seq=%s lat=%.6f lon=%.6f",
-                fix.get("source", "unknown"),
-                fix.get("seq", -1),
+                "[%s #%d] lat=%.6f lon=%.6f acc=%.1fm speed=%.1fm/s seq=%s",
+                source,
+                stream_counts.get(source, 0),
                 fix.get("lat", 0.0),
-                fix.get("lon", 0.0)
+                fix.get("lon", 0.0),
+                fix.get("h_accuracy_m", 0.0),
+                fix.get("speed_mps", 0.0),
+                fix.get("seq", -1)
             )
             LOGGER.debug("fix=%s", fix)
             asyncio.create_task(_persist_fix(fix))
 
     except websockets.ConnectionClosed:
-        LOGGER.info("client disconnected from %s", ws.remote_address)
+        LOGGER.info(
+            "client disconnected from %s (iOS: %d fixes, watchOS: %d fixes)",
+            ws.remote_address,
+            stream_counts.get("iOS", 0),
+            stream_counts.get("watchOS", 0)
+        )
     finally:
         _clients.discard(ws)
 

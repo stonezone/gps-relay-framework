@@ -134,6 +134,64 @@ Your iPhone 15 Pro Max:
 - **Model**: iPhone16,2
 - **OS Version**: iOS 26.1
 
+## LTE Apple Watch Behavior
+
+### Dual-Stream Architecture
+The system maintains **two independent GPS streams**:
+- **Base Stream (iPhone)**: Stationary reference with GPS + compass heading
+- **Remote Stream (Watch)**: Mobile tracker wherever the wearer roams
+
+### Watch Connectivity Modes
+
+#### 1. Bluetooth Range (Preferred)
+- **Range**: ~10-30 meters from iPhone
+- **Latency**: <1 second for location updates
+- **Data Path**: WatchConnectivity interactive messages
+- **Reliability**: High (instant delivery)
+
+#### 2. LTE Cellular (Extended Range)
+- **Range**: Unlimited (independent of iPhone proximity)
+- **Latency**: 2-10 seconds for location updates
+- **Data Path**: WatchConnectivity background transfers + application context
+- **Reliability**: Medium (network-dependent)
+
+**Important LTE Limitations:**
+- Apple Watch LTE uses **application context** for background delivery
+- Updates are **throttled by watchOS** (not controlled by app)
+- Expect 5-15 second intervals between updates when out of Bluetooth range
+- Interactive messaging unavailable when iPhone unreachable
+- Background file transfers used as fallback with retry queue
+
+### Expected Update Rates
+
+| Scenario | Update Frequency | Latency | Reliability |
+|----------|-----------------|---------|-------------|
+| Bluetooth range | 1-2 Hz | <1s | ✅ High |
+| LTE nearby | 0.2-1 Hz | 2-5s | ⚠️ Medium |
+| LTE distant | 0.06-0.2 Hz | 5-15s | ⚠️ Medium |
+| Watch disconnected | 0 Hz | N/A | ❌ None |
+
+### Operator Guidance
+
+**For Base Station Setup:**
+1. Place iPhone in stable location (desk, mount, etc.)
+2. Connect to Jetson via USB tethering or WiFi
+3. Start relay with WebSocket enabled
+4. Verify base stream shows minimal movement (hysteresis mode active)
+
+**For Remote Tracker Operation:**
+1. Wear Apple Watch normally
+2. Start workout-based tracking
+3. Watch operates in Bluetooth range: expect real-time updates
+4. Watch roams beyond Bluetooth: expect 5-15s update intervals (LTE)
+5. Monitor "Remote Tracker" section in iPhone app for last update age
+
+**Troubleshooting Remote Stream:**
+- **No remote updates**: Check watch app is running and workout active
+- **Stale remote data (>30s)**: Watch may be in power-saving mode or poor LTE signal
+- **Duplicate sequence warnings**: Normal during connectivity transitions
+- **Queue depth growing**: Watch experiencing connectivity issues, queue will flush when reachable
+
 ## Testing the App
 
 Once deployed, the watch app should:
@@ -141,7 +199,7 @@ Once deployed, the watch app should:
 2. Display "Workout Status" section
 3. Show "Fixes sent" counter
 4. Display GPS coordinates when tracking (Lat, Lon, Accuracy, Altitude)
-5. Send location fixes to paired iPhone via WatchConnectivity
+5. Send location fixes to paired iPhone via WatchConnectivity (multiple channels)
 
 ## Next Steps After Deployment
 

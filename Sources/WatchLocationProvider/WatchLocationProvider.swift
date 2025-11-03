@@ -24,6 +24,10 @@ public final class WatchLocationProvider: NSObject {
     private let encoder = JSONEncoder()
     private let fileManager = FileManager.default
     private var lastContextSequence: Int?
+    private var lastContextPushDate: Date?
+    private var lastContextAccuracy: Double?
+    private let contextPushInterval: TimeInterval = 3
+    private let contextAccuracyDelta: Double = 5
     private var activeFileTransfers: [WCSessionFileTransfer: (url: URL, fix: LocationFix)] = [:]
 
     public override init() {
@@ -64,6 +68,8 @@ public final class WatchLocationProvider: NSObject {
         workoutSession = nil
         workoutBuilder = nil
         lastContextSequence = nil
+        lastContextPushDate = nil
+        lastContextAccuracy = nil
         activeFileTransfers.removeAll()
     }
 
@@ -146,13 +152,34 @@ public final class WatchLocationProvider: NSObject {
 
     private func updateApplicationContextWithFix(_ fix: LocationFix) {
         guard wcSession.activationState == .activated else { return }
-        if lastContextSequence == fix.sequence { return }
+
+        let now = Date()
+        if lastContextSequence == fix.sequence {
+            return
+        }
+
+        if let lastPush = lastContextPushDate,
+           now.timeIntervalSince(lastPush) < contextPushInterval,
+           let lastAccuracy = lastContextAccuracy,
+           abs(lastAccuracy - fix.horizontalAccuracyMeters) < contextAccuracyDelta {
+            return
+        }
         do {
             let data = try encoder.encode(fix)
-            let context = ["latestFix": data]
+            let metadata: [String: Any] = [
+                "seq": fix.sequence,
+                "timestamp": fix.timestamp.timeIntervalSince1970,
+                "accuracy": fix.horizontalAccuracyMeters
+            ]
+            let context: [String: Any] = [
+                "latestFix": data,
+                "metadata": metadata
+            ]
             try wcSession.updateApplicationContext(context)
             print("[WatchLocationProvider] Updated application context with latest fix")
             lastContextSequence = fix.sequence
+            lastContextPushDate = now
+            lastContextAccuracy = fix.horizontalAccuracyMeters
         } catch {
             print("[WatchLocationProvider] Failed to update context: \(error.localizedDescription)")
             // Non-fatal, other methods will still deliver
