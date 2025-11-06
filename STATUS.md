@@ -1,6 +1,6 @@
 # GPS Relay Framework – Status for Claude Code
 
-_Last updated: 2025-11-03_
+_Last updated: 2025-01-05_
 
 ## Mission Snapshot
 - **Primary goal**: Stationary iPhone base continuously streams its own GPS/heading while relaying near-real-time Apple Watch fixes as a second, distinct stream.
@@ -11,8 +11,11 @@ _Last updated: 2025-11-03_
 - **Watch reliability**: WatchConnectivity messages retry with exponential backoff, staleness pruning, and deduplication; pending payloads flush when reachability returns.
 - **Base station optimisation**: Phone speed samples feed a hysteresis-based low-power mode; heading updates restart when motion resumes.
 - **Health visibility**: `streamHealthSnapshot()` exposes per-stream status for UI/telemetry; throttled logs surface degradations.
-- **Watch app** (`Sources/WatchLocationProvider/WatchLocationProvider.swift`): application-context updates throttled (time + accuracy deltas) with metadata; background file transfers cleanly retried/cleaned.
+- **Watch app** (`Sources/WatchLocationProvider/WatchLocationProvider.swift`): application-context updates throttled to 0.5s (real-time ~2Hz max) + accuracy deltas, enabling live GPS in LTE mode; background file transfers cleanly retried/cleaned.
 - **Jetson server** (`jetson/jetsrv.py`): logs and disconnect summaries track iOS vs. watch fix counts separately.
+
+## Recent Changes
+- **v1.0.4** (2025-01-05) – Real-time Watch GPS: Reduced application context throttle from 10s to 0.5s, achieving 20x latency improvement for live LTE mode tracking.
 
 ## Outstanding Work (see `TODO.md:18-48`)
 - **Phase 4** – Validation & Docs ✅ **COMPLETE**

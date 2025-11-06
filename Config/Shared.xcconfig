@@ -12,8 +12,8 @@
 PRODUCT_NAME = iosTrackerApp
 PRODUCT_DISPLAY_NAME = GPS Tracker
 PRODUCT_BUNDLE_IDENTIFIER = com.iostracker.iosapp
-MARKETING_VERSION = 1.0.3
-CURRENT_PROJECT_VERSION = 4
+MARKETING_VERSION = 1.0.4
+CURRENT_PROJECT_VERSION = 5
 
 // ==========================================
 // Platform Configuration

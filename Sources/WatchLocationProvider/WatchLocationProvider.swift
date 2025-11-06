@@ -26,8 +26,11 @@ public final class WatchLocationProvider: NSObject {
     private var lastContextSequence: Int?
     private var lastContextPushDate: Date?
     private var lastContextAccuracy: Double?
-    private let contextPushInterval: TimeInterval = 3
-    private let contextAccuracyDelta: Double = 5
+    // Application context throttle: 0.5s allows ~2Hz max (within Apple's 1-2Hz recommendation)
+    // while capturing all Watch GPS fixes (~1Hz). Accuracy bypass allows immediate updates
+    // when horizontal accuracy changes >5m, overriding time throttle for critical improvements.
+    private let contextPushInterval: TimeInterval = 0.5  // Was: 10.0
+    private let contextAccuracyDelta: Double = 5.0  // meters - unchanged
     private var activeFileTransfers: [WCSessionFileTransfer: (url: URL, fix: LocationFix)] = [:]
 
     public override init() {
@@ -54,7 +57,11 @@ public final class WatchLocationProvider: NSObject {
 
     public func stop() {
         locationManager.stopUpdatingLocation()
-        workoutSession?.end()
+        
+        // Only end workout if it's actually running
+        if workoutSession?.state == .running {
+            workoutSession?.end()
+        }
         workoutBuilder?.endCollection(withEnd: Date()) { [weak self] _, error in
             if let error {
                 self?.delegate?.didFail(error)

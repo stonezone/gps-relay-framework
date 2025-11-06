@@ -21,7 +21,7 @@ public struct ContentView: View {
 
                     Spacer()
 
-                    Text("v1.0.3")
+                    Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.4")")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                         .padding(.bottom, 8)

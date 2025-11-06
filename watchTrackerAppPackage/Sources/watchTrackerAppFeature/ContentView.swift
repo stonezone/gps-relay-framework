@@ -22,7 +22,7 @@ public struct ContentView: View {
                     Spacer()
 
                     // MARK: - Version Footer
-                    Text("v1.0.0")
+                    Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.4")")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                         .padding(.bottom, 4)
