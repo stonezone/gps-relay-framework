@@ -253,6 +253,11 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
     private var fixTimestampsBySource: [LocationFix.Source: [Date]] = [:]
     private let healthWindow: TimeInterval = 10
     private var lastHealthLogTime: Date?
+    
+    // Issue #20: Compass heading rate limiting
+    private var lastHeadingPublishTime: Date?
+    private let minHeadingInterval: TimeInterval = 0.5  // Max 2Hz heading updates
+    private let minHeadingChangeDegrees: Double = 2.0   // Min change to publish
 
     // MARK: - Telemetry Metrics (Phase 4.2)
     
@@ -271,11 +276,30 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
     /// Total number of watch connectivity transitions (connect/disconnect events)
     private(set) var connectivityTransitions: Int = 0
 
+    /// Location fusion mode for combining multiple GPS sources.
+    ///
+    /// - Warning: For robot cameraman use cases, fusion should remain **disabled**.
+    ///   Fusion creates a geographic midpoint between sources, which is wrong when
+    ///   tracking a subject (watch) relative to a base station (phone/camera).
+    ///   The robot needs `Vector = Subject - Base`, not the midpoint.
+    ///
+    /// - Note: Fusion is only appropriate when multiple trackers are on the **same subject**
+    ///   (e.g., phone + watch both worn by the same person for redundancy).
     public enum FusionMode: Sendable {
+        /// No fusion - base and remote are treated as independent sources (default)
+        /// Use this for robot cameraman: base = camera position, remote = subject position
         case disabled
+
+        /// Weighted average fusion based on GPS accuracy
+        /// Only use when multiple devices track the SAME physical subject
         case weightedAverage
     }
 
+    /// Fusion mode for combining base and remote locations.
+    /// Default is `.disabled` - appropriate for robot cameraman tracking.
+    ///
+    /// - Warning: Do not enable fusion for robot cameraman use cases.
+    ///   See `FusionMode` documentation for details.
     public var fusionMode: FusionMode = .disabled
 
     private(set) var currentUpdate: RelayUpdate?
@@ -635,9 +659,9 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
                 verticalAccuracyMeters: max(location.verticalAccuracy, 0),
                 speedMetersPerSecond: max(location.speed, 0),
                 courseDegrees: location.course >= 0 ? location.course : 0,
-                headingDegrees: self.currentHeading?.magneticHeading.isNaN == false ? self.currentHeading?.magneticHeading : nil,
+                headingDegrees: self.resolveHeading(from: self.currentHeading),  // Prefers trueHeading for gimbal accuracy
                 batteryFraction: batteryLevel,
-                sequence: Int(Int64(Date().timeIntervalSinceReferenceDate * 1000) % Int64(Int.max))
+                sequence: AtomicSequenceGenerator.shared.next()  // Issue #3: Use atomic generator
             )
             self.handleInboundFix(fix)
             self.updateBaseStationMotionState(with: location, generatedFix: fix)
@@ -906,6 +930,15 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
 """)
     }
 
+    /// Creates a fused location by averaging base and remote GPS sources.
+    ///
+    /// - Warning: This creates a geographic midpoint between the two sources.
+    ///   Do NOT use for robot cameraman tracking where base ≠ subject.
+    ///   Only appropriate when both devices track the same physical subject.
+    ///
+    /// The fusion uses accuracy-weighted averaging:
+    /// - Higher accuracy measurements contribute more to the final position
+    /// - Stale measurements (> fusionWindow) are ignored
     private func fusedLocation(from newFix: LocationFix) -> LocationFix {
         let counterpart: LocationFix?
         switch newFix.source {
@@ -1005,19 +1038,55 @@ extension LocationRelayService: CLLocationManagerDelegate {
 
     public func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
         // Store the latest heading for use when publishing location fixes
+        let previousResolvedHeading = resolveHeading(from: currentHeading)
         currentHeading = newHeading
 
-        // Immediately publish heading update for base station (phone)
-        // This ensures compass heading updates without waiting for GPS location changes
-        let magneticHeading = newHeading.magneticHeading
-        guard !magneticHeading.isNaN else { return }
+        // Issue #20: Rate limit heading-only updates to reduce bandwidth
+        // Use trueHeading (accounts for magnetic declination) when available for gimbal accuracy
+        guard let resolvedHeading = resolveHeading(from: newHeading) else { return }
 
-        Task { [magneticHeading] in
-            await self.publishHeadingUpdate(magneticHeading)
+        let now = Date()
+
+        // Check time-based rate limit
+        if let lastTime = lastHeadingPublishTime,
+           now.timeIntervalSince(lastTime) < minHeadingInterval {
+            return  // Too soon since last heading publish
+        }
+
+        // Check if heading changed enough to warrant update
+        if let prevHeading = previousResolvedHeading {
+            var delta = abs(resolvedHeading - prevHeading)
+            if delta > 180 { delta = 360 - delta }  // Handle wrap-around
+            if delta < minHeadingChangeDegrees {
+                return  // Change too small
+            }
+        }
+
+        lastHeadingPublishTime = now
+
+        Task { [resolvedHeading] in
+            await self.publishHeadingUpdate(resolvedHeading)
         }
     }
 
-    private func publishHeadingUpdate(_ magneticHeading: Double) async {
+    /// Resolve best heading from CLHeading.
+    /// Prefers trueHeading (corrected for magnetic declination) for accurate gimbal control.
+    /// Falls back to magneticHeading if trueHeading is unavailable (requires location services).
+    private func resolveHeading(from heading: CLHeading?) -> Double? {
+        guard let heading else { return nil }
+
+        // trueHeading is -1 if location services unavailable or heading invalid
+        // trueHeading accounts for magnetic declination - essential for gimbal accuracy
+        if heading.trueHeading >= 0 {
+            return heading.trueHeading
+        }
+
+        // Fallback to magnetic heading (less accurate but always available when compass works)
+        let magnetic = heading.magneticHeading
+        return magnetic.isNaN ? nil : magnetic
+    }
+
+    private func publishHeadingUpdate(_ heading: Double) async {
         await MainActor.run {
             guard let baseFix = self.latestPhoneFix else { return }
 
@@ -1032,9 +1101,9 @@ extension LocationRelayService: CLLocationManagerDelegate {
                 verticalAccuracyMeters: baseFix.verticalAccuracyMeters,
                 speedMetersPerSecond: baseFix.speedMetersPerSecond,
                 courseDegrees: baseFix.courseDegrees,
-                headingDegrees: magneticHeading,
+                headingDegrees: heading,  // Now uses trueHeading when available
                 batteryFraction: batteryLevel,
-                sequence: Int(Int64(Date().timeIntervalSinceReferenceDate * 1000) % Int64(Int.max))
+                sequence: AtomicSequenceGenerator.shared.next()  // Issue #3: Use atomic generator
             )
 
             self.handleInboundFix(updatedFix)
@@ -1057,13 +1126,26 @@ extension LocationRelayService: WCSessionDelegate {
     }
 
     public func sessionDidBecomeInactive(_ session: WCSession) {
+        // Issue #10: Properly handle session becoming inactive
         // Called when the session can no longer be used to modify or add any new transfers
         // This occurs when the user switches to a different Apple Watch
+        print("[LocationRelayService] WCSession became inactive")
+        isWatchConnected = false
+        health = .degraded(reason: "Watch session inactive")
     }
 
     public func sessionDidDeactivate(_ session: WCSession) {
+        // Issue #10: Properly handle session deactivation
         // Called when all outstanding messages and transfers have been delivered
         // After this is called, we should reactivate the session for the new watch
+        print("[LocationRelayService] WCSession deactivated, reactivating...")
+        
+        // Reset watch-related state for new session
+        lastWatchFixDate = nil
+        latestWatchFix = nil
+        lastSequenceBySource[.watchOS] = nil
+        
+        // Reactivate for new watch
         session.activate()
     }
 
@@ -1090,6 +1172,21 @@ extension LocationRelayService: WCSessionDelegate {
         print("[LocationRelayService] Received message data: \(messageData.count) bytes")
         isWatchConnected = true  // We just received data, so watch is definitely connected
         handleIncomingWatchMessage(messageData)
+    }
+    
+    // Issue #2: Handle message with reply handler for delivery confirmation
+    public func session(_ session: WCSession, didReceiveMessageData messageData: Data, replyHandler: @escaping (Data) -> Void) {
+        print("[LocationRelayService] Received message data with reply handler: \(messageData.count) bytes")
+        isWatchConnected = true
+        handleIncomingWatchMessage(messageData)
+        
+        // Send acknowledgment back to watch
+        let ack: [String: Any] = ["ack": true, "ts": Date().timeIntervalSince1970]
+        if let ackData = try? JSONSerialization.data(withJSONObject: ack) {
+            replyHandler(ackData)
+        } else {
+            replyHandler(Data())
+        }
     }
 
     public func session(_ session: WCSession, didReceive file: WCSessionFile) {

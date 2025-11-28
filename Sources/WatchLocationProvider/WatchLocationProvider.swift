@@ -27,22 +27,84 @@ public final class WatchLocationProvider: NSObject {
     private var lastContextPushDate: Date?
     private var lastContextAccuracy: Double?
     
-    // MAXIMUM PERFORMANCE MODE
-    // Since battery life isn't a concern (Ultra with 2hr target), optimize for lowest latency.
-    // Application context throttle: 0.25s allows ~4Hz max (pushing Apple's limits)
-    // Accuracy bypass triggers on any 2m+ change for responsive tracking
-    private let contextPushInterval: TimeInterval = 0.25  // Was: 0.5s, aggressive for tracking
-    private let contextAccuracyDelta: Double = 2.0  // Was: 5.0m, more sensitive
+    // APPLICATION CONTEXT CONFIGURATION
+    // Application context is for SNAPSHOT data, not streaming. Apple throttles aggressively.
+    // Real-time streaming uses: Bluetooth (sendMessageData) or Direct LTE WebSocket
+    // Context serves as a backup snapshot that survives app restarts
+    private let contextPushInterval: TimeInterval = 2.0  // Was: 0.25s (caused throttling)
+    private let contextAccuracyDelta: Double = 5.0  // Was: 2.0m, less aggressive for snapshots
     private var activeFileTransfers: [WCSessionFileTransfer: (url: URL, fix: LocationFix)] = [:]
+    
+    // Context update failure tracking (Issue #1)
+    private var consecutiveContextFailures: Int = 0
+    private let maxContextFailures: Int = 5
+    private var contextUpdatesDisabled: Bool = false
     
     // Performance tracking
     private var fixCount: Int = 0
     private var sessionStartTime: Date?
+    
+    // Issue #21: File transfer exponential backoff
+    private var fileTransferRetryCount: Int = 0
+    private let maxFileTransferRetries: Int = 5
+    private let baseRetryDelay: TimeInterval = 0.5
+
+    // MARK: - Direct WebSocket Transport (LTE Bypass)
+    // When iPhone is not reachable via Bluetooth, send directly to server over LTE
+    // This avoids WCSession's iCloud relay which has 10-60s latency
+    private var directTransport: WatchDirectTransport?
+    private var useDirectTransportWhenAvailable: Bool = true
+
+    /// Statistics for transport path usage
+    public private(set) var bluetoothSendCount: Int = 0
+    public private(set) var directLTESendCount: Int = 0
+    public private(set) var fileTransferSendCount: Int = 0
 
     public override init() {
         super.init()
         locationManager.delegate = self
         encoder.outputFormatting = [.withoutEscapingSlashes]
+    }
+
+    // MARK: - Direct Transport Configuration
+
+    /// Configure direct WebSocket connection to server for LTE bypass.
+    /// Call this before startWorkoutAndStreaming() to enable direct mode.
+    /// - Parameters:
+    ///   - serverURL: WebSocket URL for direct connection (e.g., wss://your-server.com/watch)
+    ///   - bearerToken: Optional authentication token
+    ///   - deviceId: Optional device identifier for server-side tracking
+    public func configureDirectTransport(
+        serverURL: URL,
+        bearerToken: String? = nil,
+        deviceId: String? = nil
+    ) {
+        var config = WatchDirectTransport.Configuration()
+        config.serverURL = serverURL
+        config.bearerToken = bearerToken
+        config.deviceId = deviceId ?? UUID().uuidString
+
+        directTransport = WatchDirectTransport(configuration: config)
+        directTransport?.onStateChanged = { [weak self] state in
+            print("[WatchLocationProvider] Direct transport state: \(state)")
+            self?.handleDirectTransportStateChange(state)
+        }
+        directTransport?.onError = { [weak self] error in
+            print("[WatchLocationProvider] Direct transport error: \(error.localizedDescription)")
+            self?.delegate?.didFail(error)
+        }
+
+        print("[WatchLocationProvider] Direct transport configured for \(serverURL.absoluteString)")
+    }
+
+    /// Enable or disable direct transport usage when iPhone is not reachable
+    public func setDirectTransportEnabled(_ enabled: Bool) {
+        useDirectTransportWhenAvailable = enabled
+        print("[WatchLocationProvider] Direct transport enabled: \(enabled)")
+    }
+
+    private func handleDirectTransportStateChange(_ state: WatchDirectTransport.ConnectionState) {
+        // Could notify delegate or update UI about connection mode
     }
 
     public func startWorkoutAndStreaming(activity: HKWorkoutActivityType = .other) {
@@ -51,6 +113,12 @@ public final class WatchLocationProvider: NSObject {
         // Extended runtime session requires special entitlement - omitting for now
         // The workout session itself keeps the app active
         configureWatchConnectivity()
+
+        // Open direct transport if configured (for LTE bypass)
+        if useDirectTransportWhenAvailable, let transport = directTransport, transport.isConfigured {
+            transport.open()
+            print("[WatchLocationProvider] Direct transport opened for LTE bypass")
+        }
 
         // Configure for maximum update frequency
         locationManager.activityType = .other  // .other provides most frequent updates
@@ -63,7 +131,10 @@ public final class WatchLocationProvider: NSObject {
 
     public func stop() {
         locationManager.stopUpdatingLocation()
-        
+
+        // Close direct transport if open
+        directTransport?.close()
+
         // Only end workout if it's actually running
         if workoutSession?.state == .running {
             workoutSession?.end()
@@ -84,6 +155,16 @@ public final class WatchLocationProvider: NSObject {
         lastContextPushDate = nil
         lastContextAccuracy = nil
         activeFileTransfers.removeAll()
+
+        // Issue #1: Reset context failure tracking
+        consecutiveContextFailures = 0
+        contextUpdatesDisabled = false
+
+        // Issue #21: Reset file transfer retry state
+        fileTransferRetryCount = 0
+
+        // Log transport usage statistics
+        print("[WatchLocationProvider] Session stats - Bluetooth: \(bluetoothSendCount), Direct LTE: \(directLTESendCount), File: \(fileTransferSendCount)")
     }
 
     private func requestAuthorizationsIfNeeded() {
@@ -135,36 +216,100 @@ public final class WatchLocationProvider: NSObject {
         print("[WatchLocationProvider] Session state: \(wcSession.activationState.rawValue), reachable: \(wcSession.isReachable)")
         guard wcSession.activationState == .activated else {
             print("[WatchLocationProvider] Session not activated")
+            // Even without WCSession, try direct transport if available
+            sendViaDirectTransportIfAvailable(fix)
             return
         }
 
-        // Always update application context for latest fix (works in background)
-        updateApplicationContextWithFix(fix)
+        // Transport priority for real-time robot cameraman:
+        // 1. Bluetooth (sendMessageData) - lowest latency (~50-200ms)
+        // 2. Direct WebSocket over LTE - bypass iCloud relay (~200-500ms)
+        // 3. File transfer - reliable but slow (~1-5s)
+        // 4. Application context - snapshot only, heavily throttled
 
-        // Try interactive messaging first if reachable
         if wcSession.isReachable {
-            do {
-                let data = try encoder.encode(fix)
-                print("[WatchLocationProvider] Sending interactive message (\(data.count) bytes)")
-                wcSession.sendMessageData(data, replyHandler: nil) { [weak self] error in
-                    print("[WatchLocationProvider] Interactive send failed: \(error.localizedDescription), falling back to file transfer")
-                    // Retry via background transfer on failure
-                    self?.queueBackgroundTransfer(for: fix)
-                }
-            } catch {
-                print("[WatchLocationProvider] Encode error: \(error.localizedDescription)")
-                delegate?.didFail(error)
-                queueBackgroundTransfer(for: fix)
-            }
+            // PATH 1: Bluetooth available - use interactive messaging (lowest latency)
+            sendViaBluetooth(fix)
+        } else if useDirectTransportWhenAvailable,
+                  let transport = directTransport,
+                  transport.connectionState == .connected {
+            // PATH 2: No Bluetooth, but direct LTE WebSocket available
+            // This is the critical LTE bypass - avoids iCloud relay latency
+            print("[WatchLocationProvider] iPhone not reachable, using direct LTE transport")
+            transport.push(fix)
+            directLTESendCount += 1
         } else {
-            // Not reachable, use background transfer as backup
-            print("[WatchLocationProvider] Not reachable, using file transfer")
+            // PATH 3: No Bluetooth, no direct transport - fall back to file transfer
+            // This goes through iCloud relay (slow but reliable)
+            print("[WatchLocationProvider] Not reachable, no direct transport, using file transfer")
             queueBackgroundTransfer(for: fix)
+            fileTransferSendCount += 1
+        }
+
+        // Always update application context as a backup snapshot (throttled)
+        updateApplicationContextWithFix(fix)
+    }
+
+    /// Send fix via Bluetooth (WCSession interactive messaging)
+    private func sendViaBluetooth(_ fix: LocationFix) {
+        do {
+            let data = try encoder.encode(fix)
+            let sendTime = Date()
+            print("[WatchLocationProvider] Sending via Bluetooth (\(data.count) bytes)")
+
+            // Issue #2: Add delivery confirmation with reply handler
+            wcSession.sendMessageData(data, replyHandler: { [weak self] reply in
+                // Delivery confirmed - calculate round-trip time
+                let rtt = Date().timeIntervalSince(sendTime) * 1000
+                print("[WatchLocationProvider] ✓ Bluetooth delivered, RTT: \(String(format: "%.0f", rtt))ms")
+                self?.bluetoothSendCount += 1
+            }) { [weak self] error in
+                print("[WatchLocationProvider] Bluetooth send failed: \(error.localizedDescription)")
+                // Fall back to direct transport or file transfer
+                self?.handleBluetoothSendFailure(fix: fix)
+            }
+        } catch {
+            print("[WatchLocationProvider] Encode error: \(error.localizedDescription)")
+            delegate?.didFail(error)
+            handleBluetoothSendFailure(fix: fix)
+        }
+    }
+
+    /// Handle Bluetooth send failure - try direct transport, then file transfer
+    private func handleBluetoothSendFailure(fix: LocationFix) {
+        if useDirectTransportWhenAvailable,
+           let transport = directTransport,
+           transport.connectionState == .connected {
+            print("[WatchLocationProvider] Bluetooth failed, falling back to direct LTE")
+            transport.push(fix)
+            directLTESendCount += 1
+        } else {
+            print("[WatchLocationProvider] Bluetooth failed, falling back to file transfer")
+            queueBackgroundTransfer(for: fix)
+            fileTransferSendCount += 1
+        }
+    }
+
+    /// Send via direct transport if available (even without WCSession)
+    private func sendViaDirectTransportIfAvailable(_ fix: LocationFix) {
+        if useDirectTransportWhenAvailable,
+           let transport = directTransport,
+           transport.connectionState == .connected {
+            print("[WatchLocationProvider] Using direct LTE transport (WCSession unavailable)")
+            transport.push(fix)
+            directLTESendCount += 1
         }
     }
 
     private func updateApplicationContextWithFix(_ fix: LocationFix) {
         guard wcSession.activationState == .activated else { return }
+        
+        // Issue #1: Skip context updates if disabled due to repeated failures
+        guard !contextUpdatesDisabled else {
+            // Still use file transfer as backup
+            queueBackgroundTransfer(for: fix)
+            return
+        }
 
         let now = Date()
         if lastContextSequence == fix.sequence {
@@ -189,13 +334,25 @@ public final class WatchLocationProvider: NSObject {
                 "metadata": metadata
             ]
             try wcSession.updateApplicationContext(context)
+            
+            // Issue #1: Reset failure counter on success
+            consecutiveContextFailures = 0
             print("[WatchLocationProvider] Updated application context with latest fix")
             lastContextSequence = fix.sequence
             lastContextPushDate = now
             lastContextAccuracy = fix.horizontalAccuracyMeters
         } catch {
-            print("[WatchLocationProvider] Failed to update context: \(error.localizedDescription)")
-            // Non-fatal, other methods will still deliver
+            // Issue #1: Track failures and disable after threshold
+            consecutiveContextFailures += 1
+            print("[WatchLocationProvider] Context update failed (\(consecutiveContextFailures)/\(maxContextFailures)): \(error.localizedDescription)")
+            
+            if consecutiveContextFailures >= maxContextFailures {
+                contextUpdatesDisabled = true
+                print("[WatchLocationProvider] ⚠️ Context updates disabled after \(maxContextFailures) failures, using file transfer only")
+            }
+            
+            // Always queue file transfer as backup on failure
+            queueBackgroundTransfer(for: fix)
         }
     }
 
@@ -242,7 +399,7 @@ extension WatchLocationProvider: CLLocationManagerDelegate {
             courseDegrees: latest.course >= 0 ? latest.course : 0,
             headingDegrees: nil,  // Apple Watch doesn't have compass
             batteryFraction: device.batteryLevel >= 0 ? Double(device.batteryLevel) : 0,
-            sequence: Int(Int64(Date().timeIntervalSinceReferenceDate * 1000) % Int64(Int.max))
+            sequence: AtomicSequenceGenerator.shared.next()  // Issue #3: Use atomic generator
         )
         publishFix(fix)
     }
@@ -273,10 +430,25 @@ extension WatchLocationProvider: WCSessionDelegate {
         defer { try? fileManager.removeItem(at: record.url) }
 
         if let error {
-            print("[WatchLocationProvider] File transfer failed: \(error.localizedDescription). Retrying…")
-            queueBackgroundTransfer(for: record.fix)
+            // Issue #21: Exponential backoff on file transfer failures
+            fileTransferRetryCount += 1
+            
+            if fileTransferRetryCount > maxFileTransferRetries {
+                print("[WatchLocationProvider] File transfer failed after \(maxFileTransferRetries) retries, giving up: \(error.localizedDescription)")
+                fileTransferRetryCount = 0  // Reset for next transfer
+                return
+            }
+            
+            let delay = baseRetryDelay * pow(2.0, Double(fileTransferRetryCount - 1))
+            print("[WatchLocationProvider] File transfer failed (attempt \(fileTransferRetryCount)/\(maxFileTransferRetries)): \(error.localizedDescription). Retrying in \(String(format: "%.1f", delay))s…")
+            
+            // Schedule retry with exponential backoff
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.queueBackgroundTransfer(for: record.fix)
+            }
         } else {
             print("[WatchLocationProvider] File transfer completed successfully")
+            fileTransferRetryCount = 0  // Reset on success
         }
     }
 #endif

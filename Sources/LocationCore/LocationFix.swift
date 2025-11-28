@@ -125,14 +125,49 @@ public enum RelayHealth: Equatable, Sendable {
     case degraded(reason: String)
 }
 
+// Issue #13: Latency tracking for end-to-end pipeline monitoring
+public struct LatencyInfo: Codable, Equatable, Sendable {
+    /// Time from GPS fix timestamp to when fix was received by relay service (ms)
+    public var gpsToRelayMs: Double?
+    
+    /// Time from relay service receive to transport push (ms)
+    public var relayToTransportMs: Double?
+    
+    /// WebSocket round-trip latency (ms)
+    public var transportRttMs: Double?
+    
+    /// Total end-to-end latency from GPS timestamp to server receipt (ms)
+    public var totalMs: Double?
+    
+    public init(
+        gpsToRelayMs: Double? = nil,
+        relayToTransportMs: Double? = nil,
+        transportRttMs: Double? = nil,
+        totalMs: Double? = nil
+    ) {
+        self.gpsToRelayMs = gpsToRelayMs
+        self.relayToTransportMs = relayToTransportMs
+        self.transportRttMs = transportRttMs
+        self.totalMs = totalMs
+    }
+}
+
 public struct RelayUpdate: Codable, Equatable, Sendable {
     public var base: LocationFix?
     public var remote: LocationFix?
     public var fused: LocationFix?
+    
+    // Issue #13: End-to-end latency tracking
+    public var latency: LatencyInfo?
+    
+    /// Timestamp when this update was created (for server-side latency calculation)
+    public var relayTimestamp: Date?
 
-    public init(base: LocationFix? = nil, remote: LocationFix? = nil, fused: LocationFix? = nil) {
+    public init(base: LocationFix? = nil, remote: LocationFix? = nil, fused: LocationFix? = nil, latency: LatencyInfo? = nil) {
         self.base = base
         self.remote = remote
         self.fused = fused
+        self.latency = latency
+        self.relayTimestamp = Date()
     }
 }

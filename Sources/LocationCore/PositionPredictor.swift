@@ -15,6 +15,10 @@ public final class PositionPredictor: @unchecked Sendable {
     /// Smoothing factor for course (0-1, higher = more smoothing)
     public var courseSmoothingFactor: Double = 0.3
     
+    // Issue #15: Speed-based course confidence thresholds
+    /// Speed above which course is fully trusted (m/s)
+    public var fullCourseConfidenceSpeed: Double = 2.0
+    
     // MARK: - State
     
     private var lastFix: LocationFix?
@@ -22,6 +26,11 @@ public final class PositionPredictor: @unchecked Sendable {
     private var velocityHistory: [(speed: Double, course: Double, timestamp: Date)] = []
     private let maxHistorySize = 10
     private let lock = NSLock()
+    
+    // Issue #7: Acceleration modeling for dynamic subjects (surfing)
+    private var accelerationHistory: [Double] = []  // m/s²
+    private let maxAccelerationHistory = 5
+    private let maxRealisticAcceleration: Double = 5.0  // m/s² - surfing bounds
     
     public init() {}
     
@@ -32,11 +41,36 @@ public final class PositionPredictor: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         
+        // Issue #7: Calculate implied acceleration from velocity change
+        if let previousFix = lastFix {
+            let dt = fix.timestamp.timeIntervalSince(previousFix.timestamp)
+            if dt > 0.1 && dt < 5.0 {  // Reasonable time gap
+                let dv = fix.speedMetersPerSecond - previousFix.speedMetersPerSecond
+                let acceleration = dv / dt
+                // Clamp to realistic bounds for surfing
+                let clampedAccel = max(-maxRealisticAcceleration, min(maxRealisticAcceleration, acceleration))
+                accelerationHistory.append(clampedAccel)
+                if accelerationHistory.count > maxAccelerationHistory {
+                    accelerationHistory.removeFirst()
+                }
+            }
+        }
+        
         // Update smoothed course if speed is sufficient
+        // Issue #15: Apply speed-based course confidence weighting
         if fix.speedMetersPerSecond >= minSpeedForCourse && fix.courseDegrees > 0 {
+            // Calculate course confidence based on speed
+            // At minSpeedForCourse: low confidence (0.3), at fullCourseConfidenceSpeed: full confidence (1.0)
+            let speedRange = fullCourseConfidenceSpeed - minSpeedForCourse
+            let speedRatio = min(1.0, (fix.speedMetersPerSecond - minSpeedForCourse) / max(0.1, speedRange))
+            let courseConfidence = 0.3 + (0.7 * speedRatio)  // Range: 0.3 to 1.0
+            
+            // Adjust smoothing factor based on confidence - higher confidence = less smoothing (faster adaptation)
+            let adaptiveSmoothingFactor = courseSmoothingFactor * (1.0 - courseConfidence * 0.5)
+            
             if let current = smoothedCourse {
                 // Exponential moving average with wrap-around handling
-                smoothedCourse = smoothAngle(from: current, to: fix.courseDegrees, factor: courseSmoothingFactor)
+                smoothedCourse = smoothAngle(from: current, to: fix.courseDegrees, factor: adaptiveSmoothingFactor)
             } else {
                 smoothedCourse = fix.courseDegrees
             }
@@ -80,8 +114,15 @@ public final class PositionPredictor: @unchecked Sendable {
         let course = smoothedCourse ?? fix.courseDegrees
         let speed = fix.speedMetersPerSecond
         
-        // Calculate displacement
-        let distance = speed * elapsed
+        // Issue #7: Use acceleration modeling for better prediction
+        let avgAcceleration = accelerationHistory.isEmpty ? 0.0 : 
+            accelerationHistory.reduce(0, +) / Double(accelerationHistory.count)
+        
+        // Calculate displacement with acceleration: d = v*t + 0.5*a*t²
+        let distance = speed * elapsed + 0.5 * avgAcceleration * elapsed * elapsed
+        
+        // Predict new speed (for confidence calculation)
+        let predictedSpeed = max(0, speed + avgAcceleration * elapsed)
         let (newLat, newLon) = projectPosition(
             from: fix.coordinate,
             distanceMeters: distance,
@@ -96,7 +137,7 @@ public final class PositionPredictor: @unchecked Sendable {
             predictedAt: time,
             basedOnFixAt: fix.timestamp,
             confidence: confidence,
-            predictedSpeed: speed,
+            predictedSpeed: predictedSpeed,  // Issue #7: Use predicted speed
             predictedCourse: course
         )
     }
@@ -126,6 +167,7 @@ public final class PositionPredictor: @unchecked Sendable {
         lastFix = nil
         smoothedCourse = nil
         velocityHistory.removeAll()
+        accelerationHistory.removeAll()  // Issue #7
     }
     
     // MARK: - Private Helpers

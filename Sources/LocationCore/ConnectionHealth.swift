@@ -1,27 +1,89 @@
 import Foundation
 
+// MARK: - Clock Offset Estimator
+
+/// Estimates clock offset between two devices using RTT measurements.
+/// This helps correct for clock drift when calculating latency from timestamps.
+///
+/// Uses the NTP-style algorithm: offset = (T2 - T1 + T3 - T4) / 2
+/// where T1=send, T2=remote_receive, T3=remote_send, T4=receive
+///
+/// Simplified for one-way with RTT: offset ≈ (measuredLatency - RTT/2)
+public final class ClockOffsetEstimator: @unchecked Sendable {
+
+    private var offsetSamples: [Double] = []  // in seconds
+    private let maxSamples = 10
+    private let lock = NSLock()
+
+    /// Current estimated clock offset in seconds (positive = remote ahead)
+    public var estimatedOffset: Double {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !offsetSamples.isEmpty else { return 0 }
+        // Use median for robustness against outliers
+        let sorted = offsetSamples.sorted()
+        return sorted[sorted.count / 2]
+    }
+
+    /// Record an RTT measurement to refine offset estimate
+    /// - Parameters:
+    ///   - rttSeconds: Round-trip time in seconds
+    ///   - measuredOneWaySeconds: Measured one-way latency (remote_timestamp - local_timestamp)
+    public func recordRTTSample(rttSeconds: Double, measuredOneWaySeconds: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        // If clocks were perfectly synced, one-way latency would be RTT/2
+        // Offset = measured - expected = measured - (RTT/2)
+        let estimatedOneWay = rttSeconds / 2
+        let offset = measuredOneWaySeconds - estimatedOneWay
+
+        offsetSamples.append(offset)
+        if offsetSamples.count > maxSamples {
+            offsetSamples.removeFirst()
+        }
+    }
+
+    /// Correct a measured latency using estimated clock offset
+    public func correctedLatency(measuredSeconds: Double) -> Double {
+        return measuredSeconds - estimatedOffset
+    }
+
+    /// Reset offset estimates
+    public func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        offsetSamples.removeAll()
+    }
+}
+
 // MARK: - Connection Health Monitoring
 
-/// End-to-end latency measurement for the GPS relay pipeline
+/// End-to-end latency measurement for the GPS relay pipeline.
+///
+/// - Note: `watchToPhoneLatencyMs` compares GPS timestamp (atomic time from satellites)
+///   to phone kernel time, which can have ±200ms drift. For accurate measurements,
+///   use RTT-based correction via `ClockOffsetEstimator` or compare consecutive
+///   packet deltas instead of absolute wall-clock times.
 public struct LatencyMeasurement: Codable, Sendable {
     /// Time when GPS fix was captured on watch
     public let gpsTimestamp: Date
-    
+
     /// Time when fix was received by phone
     public let phoneReceivedAt: Date
-    
+
     /// Time when fix was sent to server
     public let serverSentAt: Date
-    
+
     /// Time when server acknowledged (if available)
     public let serverAckAt: Date?
-    
+
     /// Unique correlation ID for matching requests/responses
     public let correlationId: UUID
-    
+
     /// GPS fix sequence number
     public let sequence: Int
-    
+
     public init(
         gpsTimestamp: Date,
         phoneReceivedAt: Date = Date(),
@@ -37,18 +99,30 @@ public struct LatencyMeasurement: Codable, Sendable {
         self.correlationId = correlationId
         self.sequence = sequence
     }
-    
+
     /// Total end-to-end latency in milliseconds (if server ack available)
     public var totalLatencyMs: Double? {
         guard let ack = serverAckAt else { return nil }
         return ack.timeIntervalSince(gpsTimestamp) * 1000
     }
-    
-    /// Watch → Phone latency in milliseconds
+
+    /// Watch → Phone latency in milliseconds (uncorrected for clock drift)
+    ///
+    /// - Warning: This compares GPS atomic time to phone kernel time.
+    ///   Clock drift between devices can cause ±200ms errors or negative values.
+    ///   For accurate measurement, use `correctedWatchToPhoneLatencyMs(using:)`.
     public var watchToPhoneLatencyMs: Double {
         phoneReceivedAt.timeIntervalSince(gpsTimestamp) * 1000
     }
-    
+
+    /// Watch → Phone latency corrected for clock offset
+    /// - Parameter estimator: Clock offset estimator with RTT samples
+    public func correctedWatchToPhoneLatencyMs(using estimator: ClockOffsetEstimator) -> Double {
+        let uncorrected = phoneReceivedAt.timeIntervalSince(gpsTimestamp)
+        let corrected = estimator.correctedLatency(measuredSeconds: uncorrected)
+        return max(0, corrected * 1000)  // Clamp to non-negative
+    }
+
     /// Phone → Server latency in milliseconds (if ack available)
     public var phoneToServerLatencyMs: Double? {
         guard let ack = serverAckAt else { return nil }

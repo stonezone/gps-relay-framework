@@ -49,27 +49,29 @@ public enum TrackingMode: String, CaseIterable, Codable, Sendable {
     public var configuration: LocationConfig {
         switch self {
         case .realtime:
+            // Issue #8: Tighter thresholds for precision gimbal tracking
             return LocationConfig(
                 desiredAccuracy: kCLLocationAccuracyBest,
                 distanceFilter: kCLDistanceFilterNone,
                 estimatedBatteryUsePerHour: 15.0,
                 description: "Best accuracy, continuous updates",
                 qualityThresholds: QualityThresholds(
-                    maxHorizontalAccuracy: 30,
-                    maxAge: 5,
-                    maxSpeed: 83.3
+                    maxHorizontalAccuracy: 15,  // Was 30, tighter for gimbal
+                    maxAge: 3,                   // Was 5, fresher for tracking
+                    maxSpeed: 30                 // Was 83.3 (~186mph), now ~67mph - realistic for surfing
                 )
             )
         case .balanced:
+            // Issue #8: Tighter thresholds
             return LocationConfig(
                 desiredAccuracy: kCLLocationAccuracyNearestTenMeters,
                 distanceFilter: 10.0,
                 estimatedBatteryUsePerHour: 8.0,
                 description: "Good accuracy, suitable for most sessions",
                 qualityThresholds: QualityThresholds(
-                    maxHorizontalAccuracy: 50,
-                    maxAge: 10,
-                    maxSpeed: 83.3
+                    maxHorizontalAccuracy: 30,   // Was 50
+                    maxAge: 5,                    // Was 10
+                    maxSpeed: 50                  // Was 83.3, now ~112mph
                 )
             )
         case .powersaver:

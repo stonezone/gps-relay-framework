@@ -90,7 +90,10 @@ public protocol WebSocketTransportDelegate: AnyObject {
 // MARK: - WebSocket Transport
 
 @available(iOS 13.0, watchOS 6.0, macOS 10.15, *)
-public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWebSocketDelegate {
+public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWebSocketDelegate, @unchecked Sendable {
+    // Note: @unchecked Sendable because we manage thread safety via NSLock (queueLock)
+    // and all mutable state is accessed on the main queue via URLSession delegate
+    
     // MARK: - Properties
     
     private let url: URL
@@ -120,6 +123,28 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
     // Message queue for when disconnected
     private var messageQueue: [RelayUpdate] = []
     private let queueLock = NSLock()
+    
+    // Issue #5: Application-level heartbeat tracking
+    private var heartbeatTimer: Timer?
+    private var lastPongTime: Date?
+    private var pendingHeartbeats: [String: Date] = [:]  // correlationId -> sendTime
+    private let heartbeatInterval: TimeInterval = 5.0
+    private let heartbeatTimeout: TimeInterval = 15.0
+    
+    /// Current measured round-trip latency in milliseconds
+    public private(set) var currentLatencyMs: Double = 0
+    
+    // Issue #19: Connection quality tracking for automatic mode degradation
+    /// Connection quality score (0.0 = poor, 1.0 = excellent)
+    public private(set) var connectionQuality: Double = 1.0
+    
+    /// Delegate callback when quality degrades significantly
+    public var onQualityDegraded: ((Double) -> Void)?
+    
+    private var latencyHistory: [Double] = []
+    private var reconnectHistory: [Date] = []
+    private let latencyHistorySize = 10
+    private let reconnectHistoryWindow: TimeInterval = 300  // 5 minutes
     
     // MARK: - Initialization
     
@@ -182,6 +207,7 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
     public func close() {
         shouldReconnect = false
         cancelReconnectTimer()
+        stopHeartbeat()  // Issue #5
         
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
@@ -260,11 +286,79 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
         connectionState = .failed
     }
 
+    // Issue #12: Error classification for adaptive backoff
+    private enum ErrorCategory {
+        case network      // DNS, connectivity, timeout
+        case auth         // 401, 403, auth failures
+        case serverError  // 5xx errors
+        case clientError  // 4xx errors (except auth)
+        case unknown
+        
+        var shouldRetry: Bool {
+            switch self {
+            case .network, .serverError, .unknown: return true
+            case .auth, .clientError: return false  // Don't retry auth/client errors
+            }
+        }
+        
+        var backoffMultiplier: Double {
+            switch self {
+            case .network: return 1.0      // Standard backoff
+            case .serverError: return 1.5  // Server overloaded, back off more
+            case .auth: return 0           // No retry
+            case .clientError: return 0    // No retry
+            case .unknown: return 1.0
+            }
+        }
+    }
+    
+    private func classifyError(_ error: Error) -> ErrorCategory {
+        let nsError = error as NSError
+        
+        // Check for URL errors
+        switch nsError.code {
+        case NSURLErrorNotConnectedToInternet,
+             NSURLErrorNetworkConnectionLost,
+             NSURLErrorDNSLookupFailed,
+             NSURLErrorCannotFindHost,
+             NSURLErrorCannotConnectToHost,
+             NSURLErrorTimedOut:
+            return .network
+        case NSURLErrorUserAuthenticationRequired:
+            return .auth
+        default:
+            break
+        }
+        
+        // Check for WebSocket close codes in error info
+        if let closeCode = nsError.userInfo["closeCode"] as? Int {
+            switch closeCode {
+            case 1008: return .auth       // Policy violation (often auth)
+            case 1000...1003: return .clientError
+            case 1011, 1012, 1013: return .serverError
+            default: return .unknown
+            }
+        }
+        
+        return .unknown
+    }
+    
     private func handleConnectionFailure(error: Error) {
         delegate?.webSocketTransport(self, didEncounterError: error)
         
+        // Issue #12: Classify error for adaptive backoff
+        let errorCategory = classifyError(error)
+        
         guard shouldReconnect else {
             connectionState = .disconnected
+            return
+        }
+        
+        // Issue #12: Don't retry auth/client errors
+        if !errorCategory.shouldRetry {
+            NSLog("[WebSocketTransport] Non-retryable error (%@): %@", String(describing: errorCategory), error.localizedDescription)
+            connectionState = .failed
+            shouldReconnect = false
             return
         }
         
@@ -275,12 +369,15 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
             return
         }
         
-        // Schedule reconnection with exponential backoff
-        let backoffDelay = calculateBackoffDelay()
-        NSLog("[WebSocketTransport] Scheduling reconnection in %.1f seconds", backoffDelay)
+        // Schedule reconnection with adaptive exponential backoff
+        let backoffDelay = calculateBackoffDelay(multiplier: errorCategory.backoffMultiplier)
+        NSLog("[WebSocketTransport] Scheduling reconnection in %.1f seconds (category: %@)", backoffDelay, String(describing: errorCategory))
         
         connectionState = .reconnecting
         reconnectAttempts += 1
+        
+        // Issue #19: Track reconnection for quality calculation
+        recordReconnectAttempt()
         
         reconnectTimer = Timer.scheduledTimer(
             withTimeInterval: backoffDelay,
@@ -290,11 +387,13 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
         }
     }
     
-    private func calculateBackoffDelay() -> TimeInterval {
+    private func calculateBackoffDelay(multiplier: Double = 1.0) -> TimeInterval {
         // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
+        // Issue #12: Apply category-based multiplier
         let exponent = min(reconnectAttempts, 5) // Cap at 2^5 = 32
-        let delay = configuration.initialBackoffDelay * pow(2.0, Double(exponent))
-        return min(delay, configuration.maxBackoffDelay)
+        let baseDelay = configuration.initialBackoffDelay * pow(2.0, Double(exponent))
+        let adjustedDelay = baseDelay * max(multiplier, 0.5)  // Never less than 50% of base
+        return min(adjustedDelay, configuration.maxBackoffDelay)
     }
     
     private func cancelReconnectTimer() {
@@ -305,6 +404,9 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
     private func handleSuccessfulConnection() {
         connectionState = .connected
         reconnectAttempts = 0
+        
+        // Issue #5: Start application-level heartbeat
+        startHeartbeat()
         
         // Flush queued messages
         flushMessageQueue()
@@ -343,13 +445,23 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
 
     private func flushMessageQueue() {
         queueLock.lock()
-        let messagesToSend = messageQueue
+        // Reverse to send newest first - for real-time tracking, fresh data matters most
+        let allMessages = Array(messageQueue.reversed())
+        // Only flush most recent messages to avoid latency buildup
+        let maxFlushSize = 10
+        let messagesToSend = Array(allMessages.prefix(maxFlushSize))
+        let droppedCount = allMessages.count - messagesToSend.count
         messageQueue.removeAll()
         queueLock.unlock()
         
         guard !messagesToSend.isEmpty, let task = task else { return }
         
-        NSLog("[WebSocketTransport] Flushing %d queued messages", messagesToSend.count)
+        if droppedCount > 0 {
+            NSLog("[WebSocketTransport] Flushing %d messages (newest first), dropped %d stale", 
+                  messagesToSend.count, droppedCount)
+        } else {
+            NSLog("[WebSocketTransport] Flushing %d queued messages (newest first)", messagesToSend.count)
+        }
         
         for update in messagesToSend {
             sendMessage(update, via: task)
@@ -368,8 +480,14 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
                 switch message {
                 case .string(let text):
                     NSLog("[WebSocketTransport] Received text: %@", text)
+                    // Issue #5: Check for heartbeat pong in text format
+                    if let data = text.data(using: .utf8) {
+                        self?.handleHeartbeatResponse(data)
+                    }
                 case .data(let data):
                     NSLog("[WebSocketTransport] Received data: %d bytes", data.count)
+                    // Issue #5: Check for heartbeat pong
+                    self?.handleHeartbeatResponse(data)
                 @unknown default:
                     break
                 }
@@ -382,6 +500,138 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
         delegate?.webSocketTransport(self, didEncounterError: error)
         
         // Connection likely closed, will be handled in didCompleteWithError
+    }
+    
+    // MARK: - Issue #5: Application-Level Heartbeat
+    
+    private func startHeartbeat() {
+        stopHeartbeat()
+        lastPongTime = Date()
+        pendingHeartbeats.removeAll()
+        
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.heartbeatTimer = Timer.scheduledTimer(withTimeInterval: self.heartbeatInterval, repeats: true) { [weak self] _ in
+                self?.sendHeartbeat()
+            }
+        }
+        NSLog("[WebSocketTransport] Heartbeat started (interval: %.1fs)", heartbeatInterval)
+    }
+    
+    private func stopHeartbeat() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
+        pendingHeartbeats.removeAll()
+    }
+    
+    private func sendHeartbeat() {
+        guard let task = task, connectionState == .connected else { return }
+        
+        // Check for heartbeat timeout
+        if let lastPong = lastPongTime, Date().timeIntervalSince(lastPong) > heartbeatTimeout {
+            NSLog("[WebSocketTransport] ⚠️ Heartbeat timeout (%.1fs since last pong), reconnecting", Date().timeIntervalSince(lastPong))
+            handleConnectionFailure(error: NSError(
+                domain: "WebSocketTransport",
+                code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "Heartbeat timeout"]
+            ))
+            return
+        }
+        
+        let correlationId = UUID().uuidString.prefix(8).lowercased()
+        let heartbeat: [String: Any] = [
+            "type": "ping",
+            "id": String(correlationId),
+            "ts": Date().timeIntervalSince1970
+        ]
+        
+        do {
+            let data = try JSONSerialization.data(withJSONObject: heartbeat)
+            pendingHeartbeats[String(correlationId)] = Date()
+            
+            task.send(.data(data)) { [weak self] error in
+                if let error = error {
+                    NSLog("[WebSocketTransport] Heartbeat send error: %@", error.localizedDescription)
+                }
+                _ = self
+            }
+        } catch {
+            NSLog("[WebSocketTransport] Heartbeat encode error: %@", error.localizedDescription)
+        }
+    }
+    
+    private func handleHeartbeatResponse(_ data: Data) {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = json["type"] as? String,
+              type == "pong",
+              let correlationId = json["id"] as? String else {
+            return
+        }
+        
+        lastPongTime = Date()
+        
+        if let sendTime = pendingHeartbeats.removeValue(forKey: correlationId) {
+            let rtt = Date().timeIntervalSince(sendTime) * 1000
+            currentLatencyMs = rtt
+            
+            // Issue #19: Track latency history for quality calculation
+            latencyHistory.append(rtt)
+            if latencyHistory.count > latencyHistorySize {
+                latencyHistory.removeFirst()
+            }
+            updateConnectionQuality()
+            
+            NSLog("[WebSocketTransport] Heartbeat pong received, RTT: %.0fms, quality: %.2f", rtt, connectionQuality)
+        }
+    }
+    
+    // MARK: - Issue #19: Connection Quality Tracking
+    
+    private func updateConnectionQuality() {
+        // Calculate quality based on:
+        // 1. Average latency (lower is better)
+        // 2. Latency variance (lower is better)
+        // 3. Recent reconnection frequency (fewer is better)
+        
+        var quality = 1.0
+        
+        // Latency component (50% weight)
+        if !latencyHistory.isEmpty {
+            let avgLatency = latencyHistory.reduce(0, +) / Double(latencyHistory.count)
+            // Scale: 0-50ms = excellent, 50-200ms = good, 200-500ms = fair, >500ms = poor
+            let latencyScore = max(0, min(1, 1 - (avgLatency - 50) / 450))
+            quality *= (0.5 + 0.5 * latencyScore)
+        }
+        
+        // Variance component (25% weight)
+        if latencyHistory.count >= 3 {
+            let avg = latencyHistory.reduce(0, +) / Double(latencyHistory.count)
+            let variance = latencyHistory.map { pow($0 - avg, 2) }.reduce(0, +) / Double(latencyHistory.count)
+            let stdDev = sqrt(variance)
+            // Low variance is good - scale: 0-20ms = excellent, >100ms = poor
+            let varianceScore = max(0, min(1, 1 - stdDev / 100))
+            quality *= (0.75 + 0.25 * varianceScore)
+        }
+        
+        // Reconnection frequency component (25% weight)
+        let now = Date()
+        reconnectHistory = reconnectHistory.filter { now.timeIntervalSince($0) <= reconnectHistoryWindow }
+        let reconnectScore = max(0, min(1, 1 - Double(reconnectHistory.count) / 5))
+        quality *= (0.75 + 0.25 * reconnectScore)
+        
+        let previousQuality = connectionQuality
+        connectionQuality = quality
+        
+        // Notify if quality dropped significantly
+        if previousQuality > 0.5 && connectionQuality <= 0.5 {
+            NSLog("[WebSocketTransport] ⚠️ Connection quality degraded: %.2f -> %.2f", previousQuality, connectionQuality)
+            onQualityDegraded?(connectionQuality)
+        }
+    }
+    
+    private func recordReconnectAttempt() {
+        reconnectHistory.append(Date())
+        updateConnectionQuality()
     }
     
     // MARK: - URLSessionWebSocketDelegate
