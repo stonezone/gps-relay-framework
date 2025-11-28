@@ -22,32 +22,45 @@ public enum ConnectionState: String, CustomStringConvertible, Sendable {
 
 // MARK: - Configuration
 
+/// Payload encoding format for WebSocket messages
+public enum PayloadEncoding: Sendable {
+    /// JSON encoding (human readable, larger payload ~200+ bytes)
+    case json
+    /// CBOR encoding (binary, ~40% smaller payload ~80-90 bytes)
+    /// Recommended for cellular connections to reduce data usage and latency
+    case cbor
+}
+
 /// Configuration for WebSocket transport behavior
 public struct WebSocketTransportConfiguration: @unchecked Sendable {
     /// Maximum number of reconnection attempts before giving up
     public var maxReconnectAttempts: Int
-    
+
     /// Initial backoff delay in seconds
     public var initialBackoffDelay: TimeInterval
-    
+
     /// Maximum backoff delay in seconds
     public var maxBackoffDelay: TimeInterval
-    
+
     /// Maximum size of the message queue
     public var maxQueueSize: Int
-    
+
     /// Custom HTTP headers to include in connection request
     public var customHeaders: [String: String]
-    
+
     /// Bearer token for authentication (automatically adds Authorization header)
     public var bearerToken: String?
-    
+
     /// Custom URLSessionConfiguration for advanced TLS settings
     public var sessionConfiguration: URLSessionConfiguration
-    
+
     /// Allow ws:// connections (primarily for local development). Defaults to false.
     public var allowInsecureConnections: Bool
-    
+
+    /// Payload encoding format. CBOR is ~40% smaller than JSON.
+    /// Recommended for cellular connections. Default is JSON for compatibility.
+    public var payloadEncoding: PayloadEncoding
+
     public init(
         maxReconnectAttempts: Int = 10,
         initialBackoffDelay: TimeInterval = 1.0,
@@ -56,7 +69,8 @@ public struct WebSocketTransportConfiguration: @unchecked Sendable {
         customHeaders: [String: String] = [:],
         bearerToken: String? = nil,
         sessionConfiguration: URLSessionConfiguration = .default,
-        allowInsecureConnections: Bool = false
+        allowInsecureConnections: Bool = false,
+        payloadEncoding: PayloadEncoding = .json
     ) {
         self.maxReconnectAttempts = maxReconnectAttempts
         self.initialBackoffDelay = initialBackoffDelay
@@ -66,6 +80,19 @@ public struct WebSocketTransportConfiguration: @unchecked Sendable {
         self.bearerToken = bearerToken
         self.sessionConfiguration = sessionConfiguration
         self.allowInsecureConnections = allowInsecureConnections
+        self.payloadEncoding = payloadEncoding
+    }
+
+    /// Configuration optimized for cellular connections (CBOR encoding)
+    public static func cellular(
+        bearerToken: String? = nil,
+        customHeaders: [String: String] = [:]
+    ) -> WebSocketTransportConfiguration {
+        WebSocketTransportConfiguration(
+            customHeaders: customHeaders,
+            bearerToken: bearerToken,
+            payloadEncoding: .cbor
+        )
     }
 }
 
@@ -99,7 +126,8 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
     private let url: URL
     private var session: URLSession!
     private var task: URLSessionWebSocketTask?
-    private let encoder = JSONEncoder()
+    private let jsonEncoder = JSONEncoder()
+    private let cborEncoder = GPSCBOREncoder()
     private let configuration: WebSocketTransportConfiguration
     
     /// Current connection state
@@ -164,7 +192,7 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
             delegateQueue: .main
         )
         
-        encoder.outputFormatting = .withoutEscapingSlashes
+        jsonEncoder.outputFormatting = .withoutEscapingSlashes
     }
     
     /// Legacy initializer for backward compatibility
@@ -416,7 +444,14 @@ public final class WebSocketTransport: NSObject, LocationTransport, URLSessionWe
     
     private func sendMessage(_ update: RelayUpdate, via task: URLSessionWebSocketTask) {
         do {
-            let data = try encoder.encode(update)
+            let data: Data
+            switch configuration.payloadEncoding {
+            case .json:
+                data = try jsonEncoder.encode(update)
+            case .cbor:
+                data = try cborEncoder.encode(update)
+            }
+
             task.send(.data(data)) { [weak self] error in
                 guard let self, let error = error else { return }
                 NSLog("[WebSocketTransport] Send error: %@", String(describing: error))
