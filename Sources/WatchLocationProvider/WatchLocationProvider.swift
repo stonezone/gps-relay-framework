@@ -26,12 +26,18 @@ public final class WatchLocationProvider: NSObject {
     private var lastContextSequence: Int?
     private var lastContextPushDate: Date?
     private var lastContextAccuracy: Double?
-    // Application context throttle: 0.5s allows ~2Hz max (within Apple's 1-2Hz recommendation)
-    // while capturing all Watch GPS fixes (~1Hz). Accuracy bypass allows immediate updates
-    // when horizontal accuracy changes >5m, overriding time throttle for critical improvements.
-    private let contextPushInterval: TimeInterval = 0.5  // Was: 10.0
-    private let contextAccuracyDelta: Double = 5.0  // meters - unchanged
+    
+    // MAXIMUM PERFORMANCE MODE
+    // Since battery life isn't a concern (Ultra with 2hr target), optimize for lowest latency.
+    // Application context throttle: 0.25s allows ~4Hz max (pushing Apple's limits)
+    // Accuracy bypass triggers on any 2m+ change for responsive tracking
+    private let contextPushInterval: TimeInterval = 0.25  // Was: 0.5s, aggressive for tracking
+    private let contextAccuracyDelta: Double = 2.0  // Was: 5.0m, more sensitive
     private var activeFileTransfers: [WCSessionFileTransfer: (url: URL, fix: LocationFix)] = [:]
+    
+    // Performance tracking
+    private var fixCount: Int = 0
+    private var sessionStartTime: Date?
 
     public override init() {
         super.init()
@@ -211,6 +217,19 @@ public final class WatchLocationProvider: NSObject {
 extension WatchLocationProvider: CLLocationManagerDelegate {
     public func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let latest = locations.last else { return }
+        
+        // Track performance
+        fixCount += 1
+        let now = Date()
+        if sessionStartTime == nil { sessionStartTime = now }
+        
+        // Log update rate periodically
+        if fixCount % 10 == 0, let start = sessionStartTime {
+            let elapsed = now.timeIntervalSince(start)
+            let rate = Double(fixCount) / elapsed
+            print("[WatchLocationProvider] Performance: \(fixCount) fixes in \(String(format: "%.1f", elapsed))s = \(String(format: "%.2f", rate)) Hz")
+        }
+        
         let device = WKInterfaceDevice.current()
         let fix = LocationFix(
             timestamp: latest.timestamp,
