@@ -9,7 +9,7 @@ public class WatchTransportManager: ObservableObject {
     private var webSocket: WebSocketTransport?
     
     // ⚠️ TODO: Replace with your actual Cloudflare Tunnel URL
-    private let jetsonPublicURL = URL(string: "wss://YOUR-CLOUDFLARE-URL.trycloudflare.com")!
+    private let jetsonPublicURL = URL(string: "wss://ws.stonezone.net")!
     
     public init() {}
     
