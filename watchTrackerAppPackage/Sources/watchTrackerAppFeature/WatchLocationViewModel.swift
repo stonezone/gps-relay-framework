@@ -2,7 +2,6 @@ import SwiftUI
 import HealthKit
 import LocationCore
 import WatchLocationProvider
-import WebSocketTransport
 
 @MainActor
 public class WatchLocationViewModel: ObservableObject {
@@ -24,30 +23,6 @@ public class WatchLocationViewModel: ObservableObject {
         self.locationProvider.delegate = self
     }
 
-    /// Configure direct WebSocket transport for LTE bypass.
-    /// Call this before startTracking() with your Cloudflare Tunnel URL.
-    /// - Parameters:
-    ///   - url: Cloudflare Tunnel endpoint (e.g., wss://robot-cam.trycloudflare.com)
-    ///   - bearerToken: Optional authentication token
-    public func configureDirectTransport(url: URL, bearerToken: String? = nil) {
-        transportManager.jetsonPublicURL = url
-        transportManager.bearerToken = bearerToken
-    }
-
-    /// Enable or disable direct WebSocket transport
-    public func setDirectTransportEnabled(_ enabled: Bool) {
-        transportManager.directTransportEnabled = enabled
-    }
-
-    /// Current direct transport connection state
-    public var directConnectionState: ConnectionState {
-        transportManager.directConnectionState
-    }
-
-    /// Transport statistics
-    public var bluetoothSendCount: Int { transportManager.bluetoothSendCount }
-    public var directSendCount: Int { transportManager.directSendCount }
-
     // MARK: - Public Methods
     public func startTracking() {
         guard !isTracking else { return }
@@ -63,14 +38,10 @@ public class WatchLocationViewModel: ObservableObject {
         guard isTracking else { return }
 
         locationProvider.stop()
-        transportManager.closeDirectConnection()
 
         isTracking = false
         statusMessage = "Tracking stopped"
         workoutState = "Stopped"
-
-        // Log transport statistics
-        print("[WatchLocationViewModel] Session stats - Bluetooth: \(bluetoothSendCount), Direct LTE: \(directSendCount)")
     }
 
     // MARK: - Private Methods

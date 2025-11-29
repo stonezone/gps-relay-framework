@@ -442,14 +442,9 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
 
         recordFixTimestamp(for: fix.source)
 
-        let fusedFix: LocationFix?
-        if fusionMode == .weightedAverage {
-            fusedFix = fusedLocation(from: fix)
-        } else {
-            fusedFix = nil
-        }
-
-        let snapshot = RelayUpdate(base: latestPhoneFix, remote: latestWatchFix, fused: fusedFix)
+        // Fusion Disabled: robot cameraman tracks a single subject,
+        // so we avoid averaging positions between phone and watch.
+        let snapshot = RelayUpdate(base: latestPhoneFix, remote: latestWatchFix, fused: nil)
 
         Task { @MainActor [weak self, snapshot] in
             guard let delegate = self?.delegate else { return }
@@ -939,71 +934,6 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
     /// The fusion uses accuracy-weighted averaging:
     /// - Higher accuracy measurements contribute more to the final position
     /// - Stale measurements (> fusionWindow) are ignored
-    private func fusedLocation(from newFix: LocationFix) -> LocationFix {
-        let counterpart: LocationFix?
-        switch newFix.source {
-        case .watchOS:
-            counterpart = latestPhoneFix
-        case .iOS:
-            counterpart = latestWatchFix
-        }
-
-        guard let otherFix = counterpart else {
-            return newFix
-        }
-
-        let now = Date()
-        guard now.timeIntervalSince(otherFix.timestamp) <= fusionWindow else {
-            return newFix
-        }
-
-        let primary = newFix
-        let secondary = otherFix
-
-        let primaryWeight = fusionWeight(for: primary.horizontalAccuracyMeters)
-        let secondaryWeight = fusionWeight(for: secondary.horizontalAccuracyMeters)
-        let totalWeight = primaryWeight + secondaryWeight
-        guard totalWeight > 0 else { return newFix }
-
-        let fusedLatitude = ((primary.coordinate.latitude * primaryWeight) + (secondary.coordinate.latitude * secondaryWeight)) / totalWeight
-        let fusedLongitude = ((primary.coordinate.longitude * primaryWeight) + (secondary.coordinate.longitude * secondaryWeight)) / totalWeight
-
-        let fusedAccuracy = min(primary.horizontalAccuracyMeters, secondary.horizontalAccuracyMeters)
-        let fusedVerticalAccuracy = min(primary.verticalAccuracyMeters, secondary.verticalAccuracyMeters)
-        let fusedAltitude = primary.altitudeMeters ?? secondary.altitudeMeters
-        let fusedSpeed = max(primary.speedMetersPerSecond, secondary.speedMetersPerSecond)
-        let fusedCourse = selectCourse(primary: primary, secondary: secondary)
-        let fusedHeading = primary.headingDegrees ?? secondary.headingDegrees
-
-        return LocationFix(
-            timestamp: primary.timestamp,
-            source: primary.source,
-            coordinate: .init(latitude: fusedLatitude, longitude: fusedLongitude),
-            altitudeMeters: fusedAltitude,
-            horizontalAccuracyMeters: fusedAccuracy,
-            verticalAccuracyMeters: fusedVerticalAccuracy,
-            speedMetersPerSecond: fusedSpeed,
-            courseDegrees: fusedCourse,
-            headingDegrees: fusedHeading,
-            batteryFraction: primary.batteryFraction,
-            sequence: primary.sequence
-        )
-    }
-
-    private func fusionWeight(for accuracy: Double) -> Double {
-        let clamped = max(accuracy, 1)
-        return 1.0 / (clamped * clamped)
-    }
-
-    private func selectCourse(primary: LocationFix, secondary: LocationFix) -> Double {
-        if primary.courseDegrees > 0 {
-            return primary.courseDegrees
-        }
-        if secondary.courseDegrees > 0 {
-            return secondary.courseDegrees
-        }
-        return 0
-    }
 }
 
 extension LocationRelayService: CLLocationManagerDelegate {
