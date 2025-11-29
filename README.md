@@ -129,6 +129,128 @@ func relayService(_ service: LocationRelayService, didReceiveUpdate update: Rela
 | **Battery Life (Watch)** | 8+ hours | ✅ 8-10 hours |
 | **Test Coverage** | >80% | ✅ 81+ tests |
 
+## 📡 LTE/Cellular Deployment
+
+When the Apple Watch is **out of Bluetooth range** from the iPhone, it uses cellular (LTE) to communicate. This section covers the networking requirements for real-time tracking over LTE.
+
+### The Challenge
+
+The Watch cannot reach private IP addresses (e.g., `192.168.x.x`) over LTE. You need one of these deployment strategies:
+
+### Option A: USB Tethering (Recommended for Robot Cameraman)
+
+Connect iPhone directly to Jetson via USB cable.
+
+```
+┌─────────────┐  Bluetooth   ┌─────────────┐    USB     ┌─────────────┐
+│ Apple Watch │ ───────────▶ │   iPhone    │ ─────────▶ │   Jetson    │
+│  (Subject)  │  (~200ms)    │   (Base)    │  (~10ms)   │   (Robot)   │
+└─────────────┘              └─────────────┘            └─────────────┘
+       │                                                       ▲
+       │            Direct WebSocket (LTE)                     │
+       └───────────────────────────────────────────────────────┘
+                        (When out of Bluetooth range)
+```
+
+**Setup:**
+1. Enable **Personal Hotspot** on iPhone
+2. Connect iPhone to Jetson via USB
+3. Jetson sees iPhone as network interface (`usb0` or `eth1`)
+4. iPhone gateway IP: `172.20.10.1` (constant)
+
+```bash
+# On Jetson - verify USB tethering
+ip addr  # Look for 172.20.10.x interface
+
+# Install drivers if needed
+sudo apt-get install ipheth-utils libimobiledevice-utils usbmuxd
+```
+
+**Latency:** <300ms (Bluetooth) | 2-10s (LTE via Apple Cloud relay)
+
+### Option B: Cloudflare Tunnel (Remote LTE Access)
+
+Expose your Jetson to the internet via secure tunnel. Watch connects directly over LTE.
+
+```
+┌─────────────┐              ┌─────────────┐              ┌─────────────┐
+│ Apple Watch │ ──────────▶  │  Cloudflare │  ─────────▶  │   Jetson    │
+│    (LTE)    │   ~100ms     │    Edge     │   Tunnel     │  (Server)   │
+└─────────────┘              └─────────────┘              └─────────────┘
+```
+
+**Setup on Jetson:**
+```bash
+# Install cloudflared
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared jammy main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt-get update && sudo apt-get install cloudflared
+
+# Start tunnel (for testing - gives temporary URL)
+cloudflared tunnel --url http://localhost:8765
+
+# Output: https://random-name.trycloudflare.com
+```
+
+**Configure Watch App:**
+```swift
+// In your Watch app
+provider.configureDirectTransport(
+    serverURL: URL(string: "wss://your-tunnel.trycloudflare.com")!,
+    bearerToken: "optional-auth-token"
+)
+provider.startWorkoutAndStreaming()
+```
+
+**Latency:** ~100-200ms (consistent over LTE)
+
+### Option C: Bluetooth Only (Close Range)
+
+Keep subject within Bluetooth range (~30m) of iPhone.
+
+**Latency:** ~50-200ms (best case)
+
+### Transport Priority
+
+The framework automatically selects the best available transport:
+
+| Priority | Transport | Latency | When Used |
+|----------|-----------|---------|-----------|
+| 1 | Bluetooth (`sendMessageData`) | 50-200ms | Watch near iPhone |
+| 2 | Direct WebSocket (LTE) | 100-500ms | Configured + iPhone not reachable |
+| 3 | File Transfer (iCloud) | 1-5s | Fallback, reliable but slow |
+| 4 | Application Context | Throttled | Snapshot backup only |
+
+### Configuring Direct Transport
+
+```swift
+import WatchLocationProvider
+
+let provider = WatchLocationProvider()
+
+// Configure direct WebSocket for LTE bypass
+provider.configureDirectTransport(
+    serverURL: URL(string: "wss://your-server.com/watch")!,
+    bearerToken: "your-auth-token",  // Optional
+    deviceId: "watch-001"            // Optional
+)
+
+// Enable/disable direct transport
+provider.setDirectTransportEnabled(true)
+
+// Start tracking - will automatically use best available transport
+provider.startWorkoutAndStreaming(activity: .other)
+```
+
+### Monitoring Transport Usage
+
+```swift
+// After session ends, check transport statistics
+print("Bluetooth sends: \(provider.bluetoothSendCount)")
+print("Direct LTE sends: \(provider.directLTESendCount)")
+print("File transfers: \(provider.fileTransferSendCount)")
+```
+
 ## 📦 Project Structure
 
 ```

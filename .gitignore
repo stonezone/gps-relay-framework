@@ -139,8 +139,7 @@ ENV/
 .venv/
 *.egg-info/
 dist/
-
-# Optional extra Python noise (add if you want)
+# Optional extras:
 # .pytest_cache/
 # .mypy_cache/
 
