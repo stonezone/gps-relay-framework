@@ -654,7 +654,8 @@ public final class LocationRelayService: NSObject, @unchecked Sendable {
                 verticalAccuracyMeters: max(location.verticalAccuracy, 0),
                 speedMetersPerSecond: max(location.speed, 0),
                 courseDegrees: location.course >= 0 ? location.course : 0,
-                headingDegrees: self.resolveHeading(from: self.currentHeading),  // Prefers trueHeading for gimbal accuracy
+                // Prefer trueHeading (GPS-corrected) over magneticHeading
+                headingDegrees: (self.currentHeading?.trueHeading ?? -1) >= 0 ? self.currentHeading?.trueHeading : self.currentHeading?.magneticHeading,
                 batteryFraction: batteryLevel,
                 sequence: AtomicSequenceGenerator.shared.next()  // Issue #3: Use atomic generator
             )

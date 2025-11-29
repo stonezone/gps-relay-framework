@@ -34,7 +34,7 @@ public final class WatchLocationProvider: NSObject {
     private let contextPushInterval: TimeInterval = 10.0  // Relaxed: real-time via WatchTransportManager, context is backup only
     private let contextAccuracyDelta: Double = 5.0  // Was: 2.0m, less aggressive for snapshots
     private var activeFileTransfers: [WCSessionFileTransfer: (url: URL, fix: LocationFix)] = [:]
-    private let fileTransferLock = NSLock()  // Thread safety for activeFileTransfers
+    private let transferLock = NSLock()  // Thread safety for activeFileTransfers
     
     // Context update failure tracking (Issue #1)
     private var consecutiveContextFailures: Int = 0
@@ -155,9 +155,9 @@ public final class WatchLocationProvider: NSObject {
         lastContextSequence = nil
         lastContextPushDate = nil
         lastContextAccuracy = nil
-        fileTransferLock.lock()
+        transferLock.lock()
         activeFileTransfers.removeAll()
-        fileTransferLock.unlock()
+        transferLock.unlock()
 
         // Issue #1: Reset context failure tracking
         consecutiveContextFailures = 0
@@ -366,9 +366,9 @@ public final class WatchLocationProvider: NSObject {
             let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try data.write(to: url)
             let transfer = wcSession.transferFile(url, metadata: ["sequence": fix.sequence])
-            fileTransferLock.lock()
+            transferLock.lock()
             activeFileTransfers[transfer] = (url, fix)
-            fileTransferLock.unlock()
+            transferLock.unlock()
             print("[WatchLocationProvider] Queued file transfer")
         } catch {
             delegate?.didFail(error)
@@ -431,9 +431,9 @@ extension WatchLocationProvider: WCSessionDelegate {
     public func session(_ session: WCSession, didReceive file: WCSessionFile) {}
 
     public func session(_ session: WCSession, didFinish fileTransfer: WCSessionFileTransfer, error: Error?) {
-        fileTransferLock.lock()
+        transferLock.lock()
         let record = activeFileTransfers.removeValue(forKey: fileTransfer)
-        fileTransferLock.unlock()
+        transferLock.unlock()
 
         guard let record = record else { return }
         defer { try? fileManager.removeItem(at: record.url) }
