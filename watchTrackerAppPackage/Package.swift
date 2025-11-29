@@ -18,7 +18,8 @@ let package = Package(
             name: "watchTrackerAppFeature",
             dependencies: [
                 .product(name: "LocationCore", package: "gps-relay-framework"),
-                .product(name: "WatchLocationProvider", package: "gps-relay-framework")
+                .product(name: "WatchLocationProvider", package: "gps-relay-framework"),
+                .product(name: "WebSocketTransport", package: "gps-relay-framework")
             ]
         ),
         .testTarget(

@@ -31,7 +31,7 @@ public final class WatchLocationProvider: NSObject {
     // Application context is for SNAPSHOT data, not streaming. Apple throttles aggressively.
     // Real-time streaming uses: Bluetooth (sendMessageData) or Direct LTE WebSocket
     // Context serves as a backup snapshot that survives app restarts
-    private let contextPushInterval: TimeInterval = 2.0  // Was: 0.25s (caused throttling)
+    private let contextPushInterval: TimeInterval = 10.0  // Relaxed: real-time via WatchTransportManager, context is backup only
     private let contextAccuracyDelta: Double = 5.0  // Was: 2.0m, less aggressive for snapshots
     private var activeFileTransfers: [WCSessionFileTransfer: (url: URL, fix: LocationFix)] = [:]
     private let fileTransferLock = NSLock()  // Thread safety for activeFileTransfers
