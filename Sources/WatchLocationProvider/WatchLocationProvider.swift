@@ -13,7 +13,7 @@ public protocol WatchLocationProviderDelegate: AnyObject {
 }
 
 /// Manages workout-driven location capture on watchOS and relays fixes to the phone.
-public final class WatchLocationProvider: NSObject {
+public final class WatchLocationProvider: NSObject, @unchecked Sendable {
     public weak var delegate: WatchLocationProviderDelegate?
 
     private let workoutStore = HKHealthStore()

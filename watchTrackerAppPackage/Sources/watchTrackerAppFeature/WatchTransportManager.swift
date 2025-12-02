@@ -27,10 +27,11 @@ public class WatchTransportManager: ObservableObject {
         } else {
             // Priority 2: LTE Direct (WebSocket)
             if webSocket == nil {
-                 var config = WebSocketTransportConfiguration()
-                 config.timeout = 5.0
-                 webSocket = WebSocketTransport(url: jetsonPublicURL, configuration: config)
-                 webSocket?.open()
+                var config = WebSocketTransportConfiguration()
+                config.sessionConfiguration.timeoutIntervalForRequest = 5.0
+                config.sessionConfiguration.timeoutIntervalForResource = 5.0
+                webSocket = WebSocketTransport(url: jetsonPublicURL, configuration: config)
+                webSocket?.open()
             }
             let update = RelayUpdate(remote: fix)
             webSocket?.push(update)
